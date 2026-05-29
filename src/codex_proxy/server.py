@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from . import __version__
 from .config import ProxyConfig
+from .providers import ProviderAdapter, get_adapter
 from .store import ResponseStore
 from .translator import (
     build_cc_request, cc_to_response, stream_cc_to_response,
@@ -35,6 +36,7 @@ class AppState:
     config: ProxyConfig
     store: ResponseStore
     client: httpx.AsyncClient
+    adapter: ProviderAdapter
     start_time: float = 0.0
     request_count: int = 0
 
@@ -59,9 +61,10 @@ def configure(config: ProxyConfig) -> None:
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
     )
+    adapter = get_adapter(config.provider.name)
     app.state.proxy = AppState(
         config=config, store=store, client=client,
-        start_time=time.time(),
+        adapter=adapter, start_time=time.time(),
     )
 
 
@@ -79,9 +82,10 @@ def _api_key(auth_header: str) -> str:
 
 
 def _cc_headers(api_key: str) -> dict:
+    state = _state()
     h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    h.update(_state().config.provider.extra_headers)
-    return h
+    h.update(state.config.provider.extra_headers)
+    return state.adapter.adjust_headers(h)
 
 
 def _backend_url() -> str:
@@ -122,6 +126,7 @@ async def responses_http(request: Request,
     cc_body = build_cc_request(body)
     cc_body["model"] = model
     cc_body["stream"] = stream
+    cc_body = state.adapter.adjust_request(cc_body)
     headers = _cc_headers(api_key)
 
     if stream:
@@ -189,6 +194,7 @@ async def responses_ws(ws: WebSocket):
             cc_body = build_cc_request(body)
             cc_body["model"] = model
             cc_body["stream"] = True
+            cc_body = state.adapter.adjust_request(cc_body)
             headers = _cc_headers(api_key)
 
             rid = generate_response_id()
@@ -390,6 +396,7 @@ async def reload_config():
     try:
         new_config = load_config()
         state.config = new_config
+        state.adapter = get_adapter(new_config.provider.name)
         if (new_config.store.ttl_seconds != state.store.ttl_seconds or
                 new_config.store.max_entries != state.store.max_entries):
             state.store = ResponseStore(
