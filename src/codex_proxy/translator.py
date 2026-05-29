@@ -137,14 +137,12 @@ def cc_to_response(body: dict, model: str) -> dict:
         content = msg.get("content")
         reasoning = msg.get("reasoning_content")
 
-        # Reasoning output
         if reasoning:
             out.append({
                 "type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
                 "summary": [{"type": "summary_text", "text": reasoning}],
             })
 
-        # Text content
         if content:
             out.append({
                 "type": "message", "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -153,7 +151,6 @@ def cc_to_response(body: dict, model: str) -> dict:
                              "annotations": []}],
             })
 
-        # Tool calls
         for tc in msg.get("tool_calls", []):
             out.append({
                 "type": "function_call",
@@ -179,6 +176,78 @@ def cc_to_response(body: dict, model: str) -> dict:
                   "output_tokens": usage.get("completion_tokens", 0),
                   "total_tokens": usage.get("total_tokens", 0)},
     }
+
+
+# ── Streaming core: shared parser + helpers ─────────────────────────────
+
+async def parse_cc_stream(line_iter):
+    """Core SSE parser — yields (event_type, data) tuples.
+
+    Event types: "text", "reasoning", "tool_call", "usage"
+    """
+    async for line in line_iter:
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {})
+            rc = delta.get("reasoning_content")
+            if rc:
+                yield ("reasoning", rc)
+            txt = delta.get("content")
+            if txt:
+                yield ("text", txt)
+            for tc in delta.get("tool_calls", []):
+                yield ("tool_call", tc)
+        chunk_usage = chunk.get("usage")
+        if chunk_usage:
+            yield ("usage", chunk_usage)
+
+
+def accumulate_tool_call(tool_calls: list[dict], tc: dict) -> None:
+    """Accumulate a streaming tool_call delta into the tool_calls list."""
+    idx = tc.get("index", 0)
+    while len(tool_calls) <= idx:
+        tool_calls.append({"id": "", "function": {"name": "", "arguments": ""}})
+    if tc.get("id"):
+        tool_calls[idx]["id"] = tc["id"]
+    fn = tc.get("function", {})
+    if fn.get("name"):
+        tool_calls[idx]["function"]["name"] = fn["name"]
+    if fn.get("arguments"):
+        tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+
+def build_final_output(mid: str, full_text: str, reasoning_text: str,
+                       tool_calls: list[dict]) -> list[dict]:
+    """Build the Responses API output list from accumulated stream data."""
+    final_out: list[dict] = []
+    if reasoning_text:
+        final_out.append({
+            "type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
+            "summary": [{"type": "summary_text", "text": reasoning_text}],
+        })
+    final_out.append({
+        "type": "message", "id": mid, "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": full_text,
+                     "annotations": []}],
+    })
+    for tc in tool_calls:
+        fc_id = tc["id"] or f"fc_{uuid.uuid4().hex[:24]}"
+        final_out.append({
+            "type": "function_call", "id": fc_id, "call_id": fc_id,
+            "name": tc["function"]["name"],
+            "arguments": tc["function"]["arguments"],
+            "status": "completed",
+        })
+    return final_out
 
 
 # ── Streaming: CC SSE -> Responses API SSE ──────────────────────────────
@@ -218,54 +287,21 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
     tool_calls: list[dict] = []
     usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    async for line in cc_iter:
-        if not line.startswith("data: "):
-            continue
-        payload = line[6:].strip()
-        if payload == "[DONE]":
-            break
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-
-        for choice in chunk.get("choices", []):
-            delta = choice.get("delta", {})
-
-            # Reasoning content
-            rc = delta.get("reasoning_content")
-            if rc:
-                reasoning_text += rc
-
-            # Text content
-            txt = delta.get("content")
-            if txt:
-                full_text += txt
-                yield _ev("response.output_text.delta", {
-                    "type": "response.output_text.delta",
-                    "output_index": 0, "content_index": 0, "delta": txt})
-
-            # Tool calls
-            for tc in delta.get("tool_calls", []):
-                idx = tc.get("index", 0)
-                while len(tool_calls) <= idx:
-                    tool_calls.append({"id": "",
-                                       "function": {"name": "",
-                                                    "arguments": ""}})
-                if tc.get("id"):
-                    tool_calls[idx]["id"] = tc["id"]
-                fn = tc.get("function", {})
-                if fn.get("name"):
-                    tool_calls[idx]["function"]["name"] = fn["name"]
-                if fn.get("arguments"):
-                    tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-
-        chunk_usage = chunk.get("usage")
-        if chunk_usage:
+    async for event_type, data in parse_cc_stream(cc_iter):
+        if event_type == "reasoning":
+            reasoning_text += data
+        elif event_type == "text":
+            full_text += data
+            yield _ev("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "output_index": 0, "content_index": 0, "delta": data})
+        elif event_type == "tool_call":
+            accumulate_tool_call(tool_calls, data)
+        elif event_type == "usage":
             usage_data = {
-                "input_tokens": chunk_usage.get("prompt_tokens", 0),
-                "output_tokens": chunk_usage.get("completion_tokens", 0),
-                "total_tokens": chunk_usage.get("total_tokens", 0),
+                "input_tokens": data.get("prompt_tokens", 0),
+                "output_tokens": data.get("completion_tokens", 0),
+                "total_tokens": data.get("total_tokens", 0),
             }
 
     # Finish text
@@ -283,33 +319,19 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
                  "content": [{"type": "output_text", "text": full_text,
                               "annotations": []}]}})
 
-    # Reasoning output
-    final_out: list[dict] = []
-    if reasoning_text:
-        final_out.append({
-            "type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
-            "summary": [{"type": "summary_text", "text": reasoning_text}],
-        })
+    # Build final output
+    final_out = build_final_output(mid, full_text, reasoning_text, tool_calls)
 
-    final_out.append({"type": "message", "id": mid, "status": "completed",
-                      "role": "assistant",
-                      "content": [{"type": "output_text", "text": full_text,
-                                   "annotations": []}]})
-
-    # Tool call items
-    for i, tc in enumerate(tool_calls):
-        fc_id = tc["id"] or f"fc_{uuid.uuid4().hex[:24]}"
-        fc = {"type": "function_call", "id": fc_id, "call_id": fc_id,
-              "name": tc["function"]["name"],
-              "arguments": tc["function"]["arguments"]}
-        oi = len(final_out)
+    # Emit tool call items as separate events
+    text_and_reasoning_count = len(final_out) - len(tool_calls)
+    for i, item in enumerate(final_out[text_and_reasoning_count:], text_and_reasoning_count):
+        fc = {k: v for k, v in item.items() if k != "status"}
         yield _ev("response.output_item.added", {
             "type": "response.output_item.added",
-            "output_index": oi, "item": fc})
+            "output_index": i, "item": fc})
         yield _ev("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": oi, "item": fc})
-        final_out.append({**fc, "status": "completed"})
+            "output_index": i, "item": fc})
 
     # Completed
     completed = {"id": rid, "object": "response", "created_at": now,
@@ -320,4 +342,3 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
 
     if result is not None:
         result["response"] = completed
-

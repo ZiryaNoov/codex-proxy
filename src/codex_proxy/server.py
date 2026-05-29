@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,7 @@ from .store import ResponseStore
 from .translator import (
     build_cc_request, cc_to_response, stream_cc_to_response,
     unwrap_envelope, generate_response_id,
+    parse_cc_stream, accumulate_tool_call, build_final_output,
 )
 
 logger = logging.getLogger("codex-proxy")
@@ -31,11 +33,18 @@ _client: httpx.AsyncClient | None = None
 _start_time = 0.0
 _request_count = 0
 
+MAX_RETRIES = 1
+RETRY_DELAY = 0.5
+
 
 def configure(config: ProxyConfig) -> None:
-    global _config, _start_time, _client
+    global _config, _start_time, _client, _store
     _config = config
     _start_time = time.time()
+    _store = ResponseStore(
+        ttl_seconds=config.store.ttl_seconds,
+        max_entries=config.store.max_entries,
+    )
     _client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
     )
@@ -68,6 +77,22 @@ def _cc_headers(api_key: str) -> dict:
 
 def _backend_url() -> str:
     return _config.provider.base_url if _config else "https://api.z.ai/api/paas/v4"
+
+
+async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Response:
+    """POST with one retry on 5xx or transport errors."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = await _client.post(url, json=json_body, headers=headers)
+            if r.status_code < 500 or attempt == MAX_RETRIES:
+                return r
+            logger.warning("Upstream 5xx (attempt %d), retrying...", attempt + 1)
+        except httpx.TransportError as e:
+            if attempt == MAX_RETRIES:
+                raise
+            logger.warning("Transport error (attempt %d): %s, retrying...", attempt + 1, e)
+        await asyncio.sleep(RETRY_DELAY)
+    return r  # type: ignore[return-value]
 
 
 # ── HTTP endpoint ───────────────────────────────────────────────────────
@@ -106,7 +131,6 @@ async def responses_http(request: Request,
                 async for chunk in gen:
                     yield chunk
 
-            # Store after streaming completes
             completed = result_holder.get("response")
             if completed:
                 _store.put(completed["id"], {**completed, "_original_input": original_input})
@@ -115,8 +139,7 @@ async def responses_http(request: Request,
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
 
-    r = await _client.post(f"{_backend_url()}/chat/completions",
-                           json=cc_body, headers=headers)
+    r = await _post_with_retry(f"{_backend_url()}/chat/completions", cc_body, headers)
     if r.status_code >= 400:
         logger.error("Upstream error %d: %s", r.status_code, r.text[:500])
         return JSONResponse({"error": {"message": "upstream error",
@@ -193,48 +216,22 @@ async def responses_ws(ws: WebSocket):
                     "POST", f"{_backend_url()}/chat/completions",
                     json=cc_body, headers=headers
                 ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        payload = line[6:].strip()
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
-                        for choice in chunk.get("choices", []):
-                            delta = choice.get("delta", {})
-                            rc = delta.get("reasoning_content")
-                            if rc:
-                                reasoning_text += rc
-                            txt = delta.get("content")
-                            if txt:
-                                full_text += txt
-                                await ws.send_text(json.dumps({
-                                    "type": "response.output_text.delta",
-                                    "output_index": 0,
-                                    "content_index": 0, "delta": txt}))
-                            for tc in delta.get("tool_calls", []):
-                                idx = tc.get("index", 0)
-                                while len(tool_calls) <= idx:
-                                    tool_calls.append(
-                                        {"id": "",
-                                         "function": {"name": "",
-                                                      "arguments": ""}})
-                                if tc.get("id"):
-                                    tool_calls[idx]["id"] = tc["id"]
-                                fn = tc.get("function", {})
-                                if fn.get("name"):
-                                    tool_calls[idx]["function"]["name"] = fn["name"]
-                                if fn.get("arguments"):
-                                    tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-                        chunk_usage = chunk.get("usage")
-                        if chunk_usage:
+                    async for event_type, data in parse_cc_stream(resp.aiter_lines()):
+                        if event_type == "reasoning":
+                            reasoning_text += data
+                        elif event_type == "text":
+                            full_text += data
+                            await ws.send_text(json.dumps({
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "content_index": 0, "delta": data}))
+                        elif event_type == "tool_call":
+                            accumulate_tool_call(tool_calls, data)
+                        elif event_type == "usage":
                             usage_data = {
-                                "input_tokens": chunk_usage.get("prompt_tokens", 0),
-                                "output_tokens": chunk_usage.get("completion_tokens", 0),
-                                "total_tokens": chunk_usage.get("total_tokens", 0),
+                                "input_tokens": data.get("prompt_tokens", 0),
+                                "output_tokens": data.get("completion_tokens", 0),
+                                "total_tokens": data.get("total_tokens", 0),
                             }
             except Exception as e:
                 logger.error("WS upstream error: %s", e)
@@ -268,35 +265,19 @@ async def responses_ws(ws: WebSocket):
                                       "text": full_text,
                                       "annotations": []}]}}))
 
-            # Build final output
-            final_out: list[dict] = []
-            if reasoning_text:
-                final_out.append({
-                    "type": "reasoning",
-                    "id": f"rs_{uuid.uuid4().hex[:24]}",
-                    "summary": [{"type": "summary_text",
-                                 "text": reasoning_text}],
-                })
-            final_out.append({
-                "type": "message", "id": mid, "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": full_text,
-                             "annotations": []}]})
+            # Build final output using shared function
+            final_out = build_final_output(mid, full_text, reasoning_text, tool_calls)
 
-            for i, tc in enumerate(tool_calls):
-                fc_id = tc["id"] or f"fc_{uuid.uuid4().hex[:24]}"
-                fc = {"type": "function_call", "id": fc_id,
-                      "call_id": fc_id,
-                      "name": tc["function"]["name"],
-                      "arguments": tc["function"]["arguments"]}
-                oi = len(final_out)
+            # Emit tool call events
+            text_and_reasoning_count = len(final_out) - len(tool_calls)
+            for i, item in enumerate(final_out[text_and_reasoning_count:], text_and_reasoning_count):
+                fc = {k: v for k, v in item.items() if k != "status"}
                 await ws.send_text(json.dumps({
                     "type": "response.output_item.added",
-                    "output_index": oi, "item": fc}))
+                    "output_index": i, "item": fc}))
                 await ws.send_text(json.dumps({
                     "type": "response.output_item.done",
-                    "output_index": oi, "item": fc}))
-                final_out.append({**fc, "status": "completed"})
+                    "output_index": i, "item": fc}))
 
             completed = {"id": rid, "object": "response",
                          "created_at": now, "model": model,
@@ -316,6 +297,18 @@ async def responses_ws(ws: WebSocket):
 
 
 # ── Utility endpoints ───────────────────────────────────────────────────
+
+@app.get("/responses/{response_id}")
+async def get_response(response_id: str):
+    resp = _store.get(response_id)
+    if not resp:
+        return JSONResponse(
+            {"error": {"message": "Response not found", "code": "not_found"}},
+            status_code=404,
+        )
+    clean = {k: v for k, v in resp.items() if not k.startswith("_")}
+    return JSONResponse(clean)
+
 
 @app.get("/models")
 @app.get("/v1/models")
@@ -366,6 +359,12 @@ def run(config: ProxyConfig) -> None:
     configure(config)
     level = getattr(logging, config.server.log_level.upper(), logging.WARNING)
     logging.basicConfig(level=level, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+    if config.server.log_level == "debug":
+        config.server.log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(config.server.log_dir / "proxy.log", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+        logging.getLogger("codex-proxy").addHandler(fh)
     logger.info("codex-proxy v%s starting", __version__)
     print(f"  codex-proxy v{__version__}")
     print(f"  http://{config.server.host}:{config.server.port}")

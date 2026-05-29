@@ -46,9 +46,16 @@ class ServerConfig:
 
 
 @dataclass
+class StoreConfig:
+    ttl_seconds: int = 600
+    max_entries: int = 100
+
+
+@dataclass
 class ProxyConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
+    store: StoreConfig = field(default_factory=StoreConfig)
 
 
 def load_config(path: Path | None = None) -> ProxyConfig:
@@ -72,6 +79,7 @@ def load_config(path: Path | None = None) -> ProxyConfig:
 
     server_raw = raw.get("server", {})
     provider_raw = raw.get("provider", {})
+    store_raw = raw.get("store", {})
 
     server = ServerConfig(
         host=server_raw.get("host", "127.0.0.1"),
@@ -92,7 +100,12 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         extra_headers=provider_raw.get("extra_headers", {}),
     )
 
-    return ProxyConfig(server=server, provider=provider)
+    store = StoreConfig(
+        ttl_seconds=store_raw.get("ttl_seconds", 600),
+        max_entries=store_raw.get("max_entries", 100),
+    )
+
+    return ProxyConfig(server=server, provider=provider, store=store)
 
 
 def write_example_config(path: Path | None = None) -> Path:
@@ -107,6 +120,10 @@ def write_example_config(path: Path | None = None) -> Path:
 host = "127.0.0.1"
 port = 4242
 log_level = "warning"    # debug, info, warning, error
+
+[store]
+ttl_seconds = 600         # response cache TTL (10 min)
+max_entries = 100         # max cached responses
 
 [provider]
 # Provider: Z.AI (GLM models)

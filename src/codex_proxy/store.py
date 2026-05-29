@@ -9,25 +9,24 @@ from collections import OrderedDict
 class ResponseStore:
     """Stores completed responses so Codex can reference them in multi-turn."""
 
-    MAX_ENTRIES = 100
-    TTL_SECONDS = 600  # 10 minutes
-
-    def __init__(self):
+    def __init__(self, ttl_seconds: int = 600, max_entries: int = 100):
         self._store: OrderedDict[str, dict] = OrderedDict()
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
 
     def put(self, response_id: str, response: dict) -> None:
         self._store[response_id] = {
             "response": response,
             "timestamp": time.time(),
         }
-        if len(self._store) > self.MAX_ENTRIES:
+        if len(self._store) > self.max_entries:
             self._store.popitem(last=False)
 
     def get(self, response_id: str) -> dict | None:
         entry = self._store.get(response_id)
         if not entry:
             return None
-        if time.time() - entry["timestamp"] > self.TTL_SECONDS:
+        if time.time() - entry["timestamp"] > self.ttl_seconds:
             del self._store[response_id]
             return None
         return entry["response"]
