@@ -41,6 +41,15 @@ def configure(config: ProxyConfig) -> None:
     )
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    global _client
+    if _client:
+        await _client.aclose()
+        _client = None
+    logger.info("codex-proxy shut down")
+
+
 def _api_key(auth_header: str) -> str:
     if auth_header:
         lower = auth_header.lower()
