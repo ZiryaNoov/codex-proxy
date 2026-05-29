@@ -229,6 +229,18 @@ async def responses_ws(ws: WebSocket):
                             }
             except Exception as e:
                 logger.error("WS upstream error: %s", e)
+                error_resp = {
+                    "id": rid, "object": "response", "created_at": now,
+                    "model": model, "status": "failed",
+                    "output": [], "usage": {"input_tokens": 0,
+                                            "output_tokens": 0,
+                                            "total_tokens": 0},
+                    "error": {"message": f"Upstream error: {e}",
+                              "code": "upstream_error"},
+                }
+                await ws.send_text(json.dumps(
+                    {"type": "response.failed", "response": error_resp}))
+                continue
 
             # Finish text
             await ws.send_text(json.dumps({
