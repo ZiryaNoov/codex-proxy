@@ -177,6 +177,7 @@ async def responses_ws(ws: WebSocket):
             full_text = ""
             reasoning_text = ""
             tool_calls: list[dict] = []
+            usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
             try:
                 async with _client.stream(
@@ -219,6 +220,13 @@ async def responses_ws(ws: WebSocket):
                                     tool_calls[idx]["function"]["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                        chunk_usage = chunk.get("usage")
+                        if chunk_usage:
+                            usage_data = {
+                                "input_tokens": chunk_usage.get("prompt_tokens", 0),
+                                "output_tokens": chunk_usage.get("completion_tokens", 0),
+                                "total_tokens": chunk_usage.get("total_tokens", 0),
+                            }
             except Exception as e:
                 logger.error("WS upstream error: %s", e)
 
@@ -272,9 +280,7 @@ async def responses_ws(ws: WebSocket):
             completed = {"id": rid, "object": "response",
                          "created_at": now, "model": model,
                          "status": "completed", "output": final_out,
-                         "usage": {"input_tokens": 0,
-                                   "output_tokens": 0,
-                                   "total_tokens": 0}}
+                         "usage": usage_data}
             await ws.send_text(json.dumps(
                 {"type": "response.completed",
                  "response": completed}))

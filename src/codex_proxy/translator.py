@@ -95,6 +95,9 @@ def build_cc_request(body: dict) -> dict:
     cc: dict = {"model": model, "messages": messages,
                 "stream": body.get("stream", True)}
 
+    if cc["stream"]:
+        cc["stream_options"] = {"include_usage": True}
+
     for k in ("temperature", "top_p"):
         if k in body:
             cc[k] = body[k]
@@ -213,6 +216,7 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
     full_text = ""
     reasoning_text = ""
     tool_calls: list[dict] = []
+    usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     async for line in cc_iter:
         if not line.startswith("data: "):
@@ -255,6 +259,14 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
                     tool_calls[idx]["function"]["name"] = fn["name"]
                 if fn.get("arguments"):
                     tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+        chunk_usage = chunk.get("usage")
+        if chunk_usage:
+            usage_data = {
+                "input_tokens": chunk_usage.get("prompt_tokens", 0),
+                "output_tokens": chunk_usage.get("completion_tokens", 0),
+                "total_tokens": chunk_usage.get("total_tokens", 0),
+            }
 
     # Finish text
     yield _ev("response.output_text.done", {
@@ -302,8 +314,7 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
     # Completed
     completed = {"id": rid, "object": "response", "created_at": now,
                  "model": model, "status": "completed", "output": final_out,
-                 "usage": {"input_tokens": 0, "output_tokens": 0,
-                           "total_tokens": 0}}
+                 "usage": usage_data}
     yield _ev("response.completed", {
         "type": "response.completed", "response": completed})
 
