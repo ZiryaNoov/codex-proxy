@@ -24,7 +24,7 @@ codex-proxy translates between the two in real time.
 ### Install
 
 ```bash
-pip install git+https://github.com/ZakPro/codex-proxy.git
+pip install git+https://github.com/ZiryaNoov/codex-proxy.git
 ```
 
 ### Configure

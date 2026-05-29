@@ -36,7 +36,7 @@ class OpenRouterAdapter(ProviderAdapter):
     name: str = "openrouter"
 
     def adjust_headers(self, headers: dict) -> dict:
-        headers.setdefault("HTTP-Referer", "https://github.com/ZakPro/codex-proxy")
+        headers.setdefault("HTTP-Referer", "https://github.com/ZiryaNoov/codex-proxy")
         headers.setdefault("X-Title", "codex-proxy")
         return headers
 
