@@ -17,7 +17,7 @@ from .config import ProxyConfig
 from .store import ResponseStore
 from .translator import (
     build_cc_request, cc_to_response, stream_cc_to_response,
-    unwrap_envelope, _rid,
+    unwrap_envelope, generate_response_id,
 )
 
 logger = logging.getLogger("codex-proxy")
@@ -159,7 +159,7 @@ async def responses_ws(ws: WebSocket):
             cc_body["stream"] = True
             headers = _cc_headers(api_key)
 
-            rid = _rid()
+            rid = generate_response_id()
             mid = f"msg_{uuid.uuid4().hex[:24]}"
             now = int(time.time())
 

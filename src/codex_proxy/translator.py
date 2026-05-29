@@ -125,7 +125,7 @@ def unwrap_envelope(raw: str) -> dict:
 
 # ── Response conversion: CC -> Responses API ────────────────────────────
 
-def _rid() -> str:
+def generate_response_id() -> str:
     return f"resp_{uuid.uuid4().hex[:24]}"
 
 
@@ -172,7 +172,7 @@ def cc_to_response(body: dict, model: str) -> dict:
 
     usage = body.get("usage", {})
     return {
-        "id": _rid(), "object": "response",
+        "id": generate_response_id(), "object": "response",
         "created_at": int(time.time()), "model": model,
         "status": "completed", "output": out,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
@@ -193,7 +193,7 @@ async def stream_cc_to_response(cc_iter, model: str, result: dict | None = None)
     If *result* is provided, it will be populated with the completed response
     dict (including id and output) after the generator finishes.
     """
-    rid = _rid()
+    rid = generate_response_id()
     mid = f"msg_{uuid.uuid4().hex[:24]}"
     now = int(time.time())
 
