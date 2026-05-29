@@ -166,6 +166,7 @@ default_model = "accounts/fireworks/models/llama4-maverick-instruct-basic"
 | `/v1/models` | GET | List available models (v1 prefix) |
 | `/health` | GET | Health check (`?check_backend=true` pings upstream) |
 | `/status` | GET | Detailed server status |
+| `/reload` | POST | Reload config from disk |
 
 ## Features
 

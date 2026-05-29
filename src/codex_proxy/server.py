@@ -382,6 +382,31 @@ async def status():
     })
 
 
+@app.post("/reload")
+async def reload_config():
+    """Reload config from disk without restarting."""
+    from .config import load_config
+    state = _state()
+    try:
+        new_config = load_config()
+        state.config = new_config
+        if (new_config.store.ttl_seconds != state.store.ttl_seconds or
+                new_config.store.max_entries != state.store.max_entries):
+            state.store = ResponseStore(
+                ttl_seconds=new_config.store.ttl_seconds,
+                max_entries=new_config.store.max_entries,
+            )
+        logger.info("Config reloaded successfully")
+        return {"status": "reloaded", "provider": new_config.provider.display_name,
+                "model": new_config.provider.default_model}
+    except Exception as e:
+        logger.error("Config reload failed: %s", e)
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500,
+        )
+
+
 def run(config: ProxyConfig) -> None:
     """Run the proxy server."""
     configure(config)

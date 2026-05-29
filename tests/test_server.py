@@ -83,3 +83,11 @@ class TestGetResponse:
         data = r.json()
         assert data["id"] == "resp_test123"
         assert "_original_input" not in data
+
+
+class TestReloadEndpoint:
+    def test_reload(self, client):
+        r = client.post("/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "reloaded"
