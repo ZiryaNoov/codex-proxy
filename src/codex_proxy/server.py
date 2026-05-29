@@ -7,10 +7,11 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import httpx
 import uvicorn
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -25,39 +26,47 @@ from .translator import (
 
 logger = logging.getLogger("codex-proxy")
 
+MAX_RETRIES = 1
+RETRY_DELAY = 0.5
+
+
+@dataclass
+class AppState:
+    config: ProxyConfig
+    store: ResponseStore
+    client: httpx.AsyncClient
+    start_time: float = 0.0
+    request_count: int = 0
+
 
 @asynccontextmanager
 async def lifespan(app):
     yield
-    if _client:
-        await _client.aclose()
+    state: AppState = app.state.proxy
+    if state.client:
+        await state.client.aclose()
     logger.info("codex-proxy shut down")
 
 
 app = FastAPI(title="codex-proxy", lifespan=lifespan)
 
-# Global state — set by configure()
-_config: ProxyConfig | None = None
-_store = ResponseStore()
-_client: httpx.AsyncClient | None = None
-_start_time = 0.0
-_request_count = 0
-
-MAX_RETRIES = 1
-RETRY_DELAY = 0.5
-
 
 def configure(config: ProxyConfig) -> None:
-    global _config, _start_time, _client, _store
-    _config = config
-    _start_time = time.time()
-    _store = ResponseStore(
+    store = ResponseStore(
         ttl_seconds=config.store.ttl_seconds,
         max_entries=config.store.max_entries,
     )
-    _client = httpx.AsyncClient(
+    client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
     )
+    app.state.proxy = AppState(
+        config=config, store=store, client=client,
+        start_time=time.time(),
+    )
+
+
+def _state() -> AppState:
+    return app.state.proxy
 
 
 def _api_key(auth_header: str) -> str:
@@ -66,25 +75,25 @@ def _api_key(auth_header: str) -> str:
         if lower.startswith("bearer "):
             return auth_header[7:].strip()
         return auth_header.strip()
-    return _config.provider.effective_api_key() if _config else ""
+    return _state().config.provider.effective_api_key()
 
 
 def _cc_headers(api_key: str) -> dict:
     h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    if _config:
-        h.update(_config.provider.extra_headers)
+    h.update(_state().config.provider.extra_headers)
     return h
 
 
 def _backend_url() -> str:
-    return _config.provider.base_url if _config else "https://api.z.ai/api/paas/v4"
+    return _state().config.provider.base_url
 
 
 async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Response:
     """POST with one retry on 5xx or transport errors."""
+    client = _state().client
     for attempt in range(MAX_RETRIES + 1):
         try:
-            r = await _client.post(url, json=json_body, headers=headers)
+            r = await client.post(url, json=json_body, headers=headers)
             if r.status_code < 500 or attempt == MAX_RETRIES:
                 return r
             logger.warning("Upstream 5xx (attempt %d), retrying...", attempt + 1)
@@ -101,12 +110,12 @@ async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Re
 @app.post("/responses")
 async def responses_http(request: Request,
                          authorization: str = Header(default="")):
-    global _request_count
-    _request_count += 1
+    state = _state()
+    state.request_count += 1
 
     body = await request.json()
-    body = _store.resolve_input(body)
-    model = body.get("model", _config.provider.default_model if _config else "glm-5.1")
+    body = state.store.resolve_input(body)
+    model = body.get("model", state.config.provider.default_model)
     stream = body.get("stream", False)
     api_key = _api_key(authorization)
 
@@ -120,8 +129,8 @@ async def responses_http(request: Request,
         original_input = body.get("input", [])
 
         async def _stream():
-            async with _client.stream("POST", f"{_backend_url()}/chat/completions",
-                                      json=cc_body, headers=headers) as resp:
+            async with state.client.stream("POST", f"{_backend_url()}/chat/completions",
+                                           json=cc_body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     error_body = await resp.aread()
                     logger.error("Upstream error %d: %s", resp.status_code, error_body[:500])
@@ -134,7 +143,7 @@ async def responses_http(request: Request,
 
             completed = result_holder.get("response")
             if completed:
-                _store.put(completed["id"], {**completed, "_original_input": original_input})
+                state.store.put(completed["id"], {**completed, "_original_input": original_input})
 
         return StreamingResponse(_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -148,7 +157,7 @@ async def responses_http(request: Request,
                             status_code=502)
 
     resp = cc_to_response(r.json(), model)
-    _store.put(resp["id"], {**resp, "_original_input": body.get("input", [])})
+    state.store.put(resp["id"], {**resp, "_original_input": body.get("input", [])})
     return JSONResponse(resp)
 
 
@@ -156,15 +165,15 @@ async def responses_http(request: Request,
 
 @app.websocket("/responses")
 async def responses_ws(ws: WebSocket):
-    global _request_count
+    state = _state()
 
     await ws.accept()
     api_key = ""
     auth = ws.headers.get("authorization", "")
     if auth:
         api_key = _api_key(auth)
-    if not api_key and _config:
-        api_key = _config.provider.effective_api_key()
+    if not api_key:
+        api_key = state.config.provider.effective_api_key()
 
     try:
         while True:
@@ -174,10 +183,9 @@ async def responses_ws(ws: WebSocket):
             except json.JSONDecodeError:
                 continue
 
-            _request_count += 1
-            body = _store.resolve_input(body)
-            model = body.get("model",
-                             _config.provider.default_model if _config else "glm-5.1")
+            state.request_count += 1
+            body = state.store.resolve_input(body)
+            model = body.get("model", state.config.provider.default_model)
             cc_body = build_cc_request(body)
             cc_body["model"] = model
             cc_body["stream"] = True
@@ -213,7 +221,7 @@ async def responses_ws(ws: WebSocket):
             usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
             try:
-                async with _client.stream(
+                async with state.client.stream(
                     "POST", f"{_backend_url()}/chat/completions",
                     json=cc_body, headers=headers
                 ) as resp:
@@ -288,8 +296,8 @@ async def responses_ws(ws: WebSocket):
                 {"type": "response.completed",
                  "response": completed}))
 
-            _store.put(rid, {**completed,
-                             "_original_input": body.get("input", [])})
+            state.store.put(rid, {**completed,
+                                  "_original_input": body.get("input", [])})
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
@@ -301,7 +309,8 @@ async def responses_ws(ws: WebSocket):
 
 @app.get("/responses/{response_id}")
 async def get_response(response_id: str):
-    resp = _store.get(response_id)
+    state = _state()
+    resp = state.store.get(response_id)
     if not resp:
         return JSONResponse(
             {"error": {"message": "Response not found", "code": "not_found"}},
@@ -314,13 +323,12 @@ async def get_response(response_id: str):
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
-    provider = _config.provider if _config else None
-    model_list = provider.models if provider else ["glm-5.1"]
+    provider = _state().config.provider
     return JSONResponse({
         "object": "list",
         "data": [{"id": m, "object": "model",
-                  "owned_by": provider.name if provider else "proxy"}
-                 for m in model_list],
+                  "owned_by": provider.name}
+                 for m in provider.models],
     })
 
 
@@ -332,25 +340,26 @@ async def health():
 
 @app.get("/status")
 async def status():
-    provider = _config.provider if _config else None
-    uptime = int(time.time() - _start_time) if _start_time else 0
+    state = _state()
+    provider = state.config.provider
+    uptime = int(time.time() - state.start_time)
     return JSONResponse({
         "proxy": "codex-proxy",
         "version": __version__,
         "status": "running",
         "uptime_seconds": uptime,
-        "requests_total": _request_count,
-        "response_store_size": _store.size(),
+        "requests_total": state.request_count,
+        "response_store_size": state.store.size(),
         "provider": {
-            "name": provider.name if provider else "unknown",
-            "display_name": provider.display_name if provider else "Unknown",
-            "base_url": provider.base_url if provider else "",
-            "models": provider.models if provider else [],
-            "default_model": provider.default_model if provider else "",
+            "name": provider.name,
+            "display_name": provider.display_name,
+            "base_url": provider.base_url,
+            "models": provider.models,
+            "default_model": provider.default_model,
         },
         "server": {
-            "host": _config.server.host if _config else "127.0.0.1",
-            "port": _config.server.port if _config else 4242,
+            "host": state.config.server.host,
+            "port": state.config.server.port,
         },
     })
 
