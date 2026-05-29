@@ -10,6 +10,7 @@ import uuid
 
 import httpx
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -24,7 +25,16 @@ from .translator import (
 
 logger = logging.getLogger("codex-proxy")
 
-app = FastAPI(title="codex-proxy")
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    if _client:
+        await _client.aclose()
+    logger.info("codex-proxy shut down")
+
+
+app = FastAPI(title="codex-proxy", lifespan=lifespan)
 
 # Global state — set by configure()
 _config: ProxyConfig | None = None
@@ -48,15 +58,6 @@ def configure(config: ProxyConfig) -> None:
     _client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
     )
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    global _client
-    if _client:
-        await _client.aclose()
-        _client = None
-    logger.info("codex-proxy shut down")
 
 
 def _api_key(auth_header: str) -> str:
