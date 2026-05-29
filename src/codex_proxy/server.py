@@ -93,7 +93,7 @@ async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Re
                 raise
             logger.warning("Transport error (attempt %d): %s, retrying...", attempt + 1, e)
         await asyncio.sleep(RETRY_DELAY)
-    return r  # type: ignore[return-value]
+    raise httpx.TransportError("Max retries exceeded")
 
 
 # ── HTTP endpoint ───────────────────────────────────────────────────────
