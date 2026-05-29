@@ -164,7 +164,7 @@ default_model = "accounts/fireworks/models/llama4-maverick-instruct-basic"
 | `/responses/{id}` | GET | Retrieve stored response by ID |
 | `/models` | GET | List available models |
 | `/v1/models` | GET | List available models (v1 prefix) |
-| `/health` | GET | Health check |
+| `/health` | GET | Health check (`?check_backend=true` pings upstream) |
 | `/status` | GET | Detailed server status |
 
 ## Features

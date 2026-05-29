@@ -31,6 +31,16 @@ class TestHealthEndpoint:
         assert data["status"] == "ok"
         assert "version" in data
 
+    def test_health_no_backend_check_by_default(self, client):
+        r = client.get("/health")
+        data = r.json()
+        assert "backend" not in data
+
+    def test_health_with_backend_check(self, client):
+        r = client.get("/health?check_backend=true")
+        data = r.json()
+        assert "backend" in data
+
 
 class TestStatusEndpoint:
     def test_status(self, client):

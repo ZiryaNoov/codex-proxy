@@ -333,9 +333,27 @@ async def models():
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "proxy": "codex-proxy",
-            "version": __version__}
+async def health(request: Request):
+    state = _state()
+    result = {
+        "status": "ok",
+        "proxy": "codex-proxy",
+        "version": __version__,
+    }
+    if request.query_params.get("check_backend"):
+        try:
+            r = await state.client.get(
+                f"{state.config.provider.base_url}/models",
+                headers={"Authorization": f"Bearer {state.config.provider.effective_api_key()}"},
+                timeout=5.0,
+            )
+            result["backend"] = "ok" if r.status_code < 400 else "error"
+            result["backend_status"] = r.status_code
+        except Exception as e:
+            result["backend"] = "unreachable"
+            result["backend_error"] = str(e)
+            result["status"] = "degraded"
+    return result
 
 
 @app.get("/status")
