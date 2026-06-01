@@ -3,8 +3,6 @@
 import time
 from unittest.mock import patch
 
-import pytest
-
 from codex_proxy.store import ResponseStore
 
 
@@ -76,6 +74,29 @@ class TestResolveInput:
             result = s.resolve_input(body)
             assert result["input"] == "hello"
 
+    def test_with_function_call_in_previous(self):
+        s = ResponseStore()
+        s.put("r1", {
+            "output": [{"type": "function_call", "id": "fc1", "call_id": "fc1",
+                        "name": "read", "arguments": "{}"}],
+            "_original_input": [],
+        })
+        body = {"previous_response_id": "r1", "input": "next"}
+        result = s.resolve_input(body)
+        types = [item.get("type") for item in result["input"]]
+        assert "function_call" in types
+
+    def test_with_string_current_input(self):
+        s = ResponseStore()
+        s.put("r1", {
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hi"}]}],
+            "_original_input": [],
+        })
+        body = {"previous_response_id": "r1", "input": "Next question"}
+        result = s.resolve_input(body)
+        assert any("Next question" in str(item) for item in result["input"])
+
 
 class TestSize:
     def test_empty(self):
@@ -86,3 +107,22 @@ class TestSize:
         s.put("r1", {"id": "r1"})
         s.put("r2", {"id": "r2"})
         assert s.size() == 2
+
+
+class TestEntries:
+    def test_empty(self):
+        s = ResponseStore()
+        assert s.entries() == []
+
+    def test_returns_ids_and_ages(self):
+        s = ResponseStore()
+        s.put("r1", {"id": "r1"})
+        s.put("r2", {"id": "r2"})
+        entries = s.entries()
+        assert len(entries) == 2
+        ids = [e[0] for e in entries]
+        assert "r1" in ids
+        assert "r2" in ids
+        ages = [e[1] for e in entries]
+        assert all(a >= 0 for a in ages)
+        assert all(a < 1 for a in ages)

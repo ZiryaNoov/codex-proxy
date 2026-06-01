@@ -1,13 +1,16 @@
 """Tests for translator module — pure functions, no I/O."""
 
-import pytest
 
 from codex_proxy.translator import (
-    input_to_messages, convert_tools, build_cc_request,
-    cc_to_response, unwrap_envelope, generate_response_id,
-    accumulate_tool_call, build_final_output,
+    accumulate_tool_call,
+    build_cc_request,
+    build_final_output,
+    cc_to_response,
+    convert_tools,
+    generate_response_id,
+    input_to_messages,
+    unwrap_envelope,
 )
-
 
 # ── input_to_messages ───────────────────────────────────────────────────
 
@@ -99,6 +102,11 @@ class TestConvertTools:
         result = convert_tools(tools)
         assert result[0]["function"]["name"] == "write"
 
+    def test_non_function_type_skipped(self):
+        tools = [{"type": "web_search", "query": "test"}]
+        result = convert_tools(tools)
+        assert result is None
+
 
 # ── build_cc_request ────────────────────────────────────────────────────
 
@@ -134,6 +142,36 @@ class TestBuildCCRequest:
     def test_no_stream_options_when_not_streaming(self):
         cc = build_cc_request({"input": "hi", "stream": False})
         assert "stream_options" not in cc
+
+    def test_tool_choice_passthrough(self):
+        cc = build_cc_request({"input": "hi", "tool_choice": "auto",
+                               "tools": [{"type": "function", "function": {
+                                   "name": "run", "parameters": {}}}]})
+        assert cc["tool_choice"] == "auto"
+
+    def test_top_p_passthrough(self):
+        cc = build_cc_request({"input": "hi", "top_p": 0.9})
+        assert cc["top_p"] == 0.9
+
+    def test_compaction_disabled(self):
+        long_input = [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": f"msg{i}"}]}
+                      for i in range(60)]
+        cc = build_cc_request({"input": long_input, "stream": False},
+                              compaction_enabled=False)
+        assert len(cc["messages"]) == 60
+
+    def test_compaction_custom_thresholds(self):
+        long_input = [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": f"msg{i}"}]}
+                      for i in range(40)]
+        cc = build_cc_request(
+            {"input": long_input, "stream": False},
+            compaction_enabled=True,
+            compaction_max_messages=30,
+            compaction_keep_last=10,
+        )
+        assert len(cc["messages"]) == 11  # 1 compaction notice + 10 kept
 
 
 # ── cc_to_response ──────────────────────────────────────────────────────
@@ -175,6 +213,23 @@ class TestCcToResponse:
         assert resp["usage"]["input_tokens"] == 10
         assert resp["usage"]["output_tokens"] == 5
 
+    def test_reasoning_only_no_content(self):
+        body = {"choices": [{"message": {"content": None,
+                                          "reasoning_content": "Thinking..."}}]}
+        resp = cc_to_response(body, "glm-5.1")
+        types = [o["type"] for o in resp["output"]]
+        assert "reasoning" in types
+
+    def test_tool_calls_with_content(self):
+        body = {"choices": [{"message": {
+            "content": "I'll help",
+            "tool_calls": [{"id": "tc1", "function": {
+                "name": "run", "arguments": "{}"}}]}}]}
+        resp = cc_to_response(body, "glm-5.1")
+        types = [o["type"] for o in resp["output"]]
+        assert "message" in types
+        assert "function_call" in types
+
 
 # ── unwrap_envelope ─────────────────────────────────────────────────────
 
@@ -188,6 +243,10 @@ class TestUnwrapEnvelope:
             '{"type":"response.create","response":{"model":"glm-5.1","input":"hi"}}')
         assert body["model"] == "glm-5.1"
         assert "type" not in body or body.get("type") != "response.create"
+
+    def test_envelope_missing_response_key(self):
+        body = unwrap_envelope('{"type":"response.create"}')
+        assert body["type"] == "response.create"
 
 
 # ── generate_response_id ────────────────────────────────────────────────

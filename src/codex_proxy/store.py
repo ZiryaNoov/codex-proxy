@@ -29,7 +29,9 @@ class ResponseStore:
         if time.time() - entry["timestamp"] > self.ttl_seconds:
             del self._store[response_id]
             return None
-        return entry["response"]
+        res = entry["response"]
+        assert isinstance(res, dict)
+        return res
 
     def resolve_input(self, body: dict) -> dict:
         """If body has previous_response_id, prepend that response's output to input."""
@@ -88,3 +90,8 @@ class ResponseStore:
 
     def size(self) -> int:
         return len(self._store)
+
+    def entries(self) -> list[tuple[str, float]]:
+        """Return list of (response_id, age_seconds) for all cached entries."""
+        now = time.time()
+        return [(rid, now - entry["timestamp"]) for rid, entry in self._store.items()]

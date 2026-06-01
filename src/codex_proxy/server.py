@@ -8,21 +8,30 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
+from .circuit_breaker import CircuitBreaker
 from .config import ProxyConfig
+from .key_rotation import KeyRotator
+from .plugins import PluginContext, PluginRegistry
 from .providers import ProviderAdapter, get_adapter
 from .store import ResponseStore
 from .translator import (
-    build_cc_request, cc_to_response, stream_cc_to_response,
-    unwrap_envelope, generate_response_id,
-    parse_cc_stream, accumulate_tool_call, build_final_output,
+    accumulate_tool_call,
+    build_cc_request,
+    build_final_output,
+    cc_to_response,
+    generate_response_id,
+    parse_cc_stream,
+    stream_cc_to_response,
+    unwrap_envelope,
 )
 
 logger = logging.getLogger("codex-proxy")
@@ -37,14 +46,24 @@ class AppState:
     store: ResponseStore
     client: httpx.AsyncClient
     adapter: ProviderAdapter
+    circuit_breaker: CircuitBreaker | None
     start_time: float = 0.0
     request_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    last_request_time: float = 0.0
+    key_rotator: KeyRotator | None = None
+    plugin_registry: PluginRegistry | None = None
 
 
 @asynccontextmanager
 async def lifespan(app):
-    yield
     state: AppState = app.state.proxy
+    if state.plugin_registry:
+        await state.plugin_registry.on_startup(state.config)
+    yield
+    if state.plugin_registry:
+        await state.plugin_registry.on_shutdown()
     if state.client:
         await state.client.aclose()
     logger.info("codex-proxy shut down")
@@ -62,14 +81,55 @@ def configure(config: ProxyConfig) -> None:
         timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
     )
     adapter = get_adapter(config.provider.name)
+    cb_config = config.circuit_breaker
+    cb = CircuitBreaker(
+        failure_threshold=cb_config.failure_threshold,
+        recovery_timeout=cb_config.recovery_timeout,
+    ) if cb_config.enabled else None
+    keys = config.provider.effective_api_keys()
+    key_rotator = None
+    if len(keys) > 1:
+        key_rotator = KeyRotator(
+            keys=keys,
+            failure_threshold=cb_config.failure_threshold,
+            recovery_timeout=cb_config.recovery_timeout,
+        )
     app.state.proxy = AppState(
         config=config, store=store, client=client,
-        adapter=adapter, start_time=time.time(),
+        adapter=adapter, circuit_breaker=cb, start_time=time.time(),
+        key_rotator=key_rotator,
+        plugin_registry=_build_plugin_registry(config),
     )
 
 
 def _state() -> AppState:
-    return app.state.proxy
+    val = app.state.proxy
+    assert isinstance(val, AppState)
+    return val
+
+
+def _build_plugin_registry(config: ProxyConfig) -> PluginRegistry | None:
+    if config.plugins.enabled and config.plugins.plugins:
+        registry = PluginRegistry()
+        registry.load(config.plugins.plugins)
+        return registry
+    return None
+
+
+def _mask_key(key: str) -> str:
+    if len(key) <= 7:
+        return "***"
+    return f"{key[:3]}...{key[-4:]}"
+
+
+def _build_plugin_ctx(request_id: str, method: str, model: str,
+                      api_key: str, stream: bool) -> PluginContext:
+    state = _state()
+    return PluginContext(
+        request_id=request_id, method=method, model=model,
+        provider=state.config.provider.name,
+        api_key_masked=_mask_key(api_key), stream=stream,
+    )
 
 
 def _api_key(auth_header: str) -> str:
@@ -78,7 +138,10 @@ def _api_key(auth_header: str) -> str:
         if lower.startswith("bearer "):
             return auth_header[7:].strip()
         return auth_header.strip()
-    return _state().config.provider.effective_api_key()
+    state = _state()
+    if state.key_rotator:
+        return state.key_rotator.next_key()
+    return state.config.provider.effective_api_key()
 
 
 def _cc_headers(api_key: str) -> dict:
@@ -109,6 +172,29 @@ async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Re
     raise httpx.TransportError("Max retries exceeded")
 
 
+async def _request_with_key_failover(url: str, json_body: dict,
+                                     headers: dict, api_key: str) -> httpx.Response:
+    """POST with retry. On auth/rate-limit errors, rotate key and retry."""
+    state = _state()
+    if not state.key_rotator:
+        return await _post_with_retry(url, json_body, headers)
+    max_attempts = len(state.key_rotator._keys)
+    r: httpx.Response | None = None
+    for _ in range(max_attempts):
+        r = await _post_with_retry(url, json_body, headers)
+        if r.status_code in (401, 403, 429):
+            state.key_rotator.record_failure(api_key, r.status_code)
+            api_key = state.key_rotator.next_key()
+            headers = _cc_headers(api_key)
+            logger.warning("Key failed with %d, rotating", r.status_code)
+            continue
+        if r.status_code < 400:
+            state.key_rotator.record_success(api_key)
+        return r
+    assert r is not None
+    return r
+
+
 # ── HTTP endpoint ───────────────────────────────────────────────────────
 
 @app.post("/responses")
@@ -116,6 +202,13 @@ async def responses_http(request: Request,
                          authorization: str = Header(default="")):
     state = _state()
     state.request_count += 1
+    state.last_request_time = time.time()
+
+    if state.circuit_breaker and not state.circuit_breaker.can_execute():
+        return JSONResponse(
+            {"error": {"message": "Circuit breaker open", "code": "circuit_open"}},
+            status_code=503,
+        )
 
     body = await request.json()
     body = state.store.resolve_input(body)
@@ -123,11 +216,22 @@ async def responses_http(request: Request,
     stream = body.get("stream", False)
     api_key = _api_key(authorization)
 
-    cc_body = build_cc_request(body)
+    cc_body = build_cc_request(
+        body,
+        compaction_enabled=state.config.compaction.enabled,
+        compaction_max_messages=state.config.compaction.max_messages,
+        compaction_keep_last=state.config.compaction.keep_last,
+    )
     cc_body["model"] = model
     cc_body["stream"] = stream
     cc_body = state.adapter.adjust_request(cc_body)
     headers = _cc_headers(api_key)
+
+    # Plugin: on_request
+    req_id = uuid.uuid4().hex[:12]
+    if state.plugin_registry:
+        ctx = _build_plugin_ctx(req_id, "http", model, api_key, stream)
+        await state.plugin_registry.on_request(ctx)
 
     if stream:
         result_holder: dict = {}
@@ -139,8 +243,15 @@ async def responses_http(request: Request,
                 if resp.status_code >= 400:
                     error_body = await resp.aread()
                     logger.error("Upstream error %d: %s", resp.status_code, error_body[:500])
+                    if state.circuit_breaker:
+                        state.circuit_breaker.record_failure()
+                    state.failure_count += 1
                     yield f"event: error\ndata: {json.dumps({'error': {'message': 'upstream error', 'status': resp.status_code}})}\n\n"
                     return
+
+                if state.circuit_breaker:
+                    state.circuit_breaker.record_success()
+                state.success_count += 1
 
                 gen = stream_cc_to_response(resp.aiter_lines(), model, result=result_holder)
                 async for chunk in gen:
@@ -154,13 +265,34 @@ async def responses_http(request: Request,
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
 
-    r = await _post_with_retry(f"{_backend_url()}/chat/completions", cc_body, headers)
+    start_t = time.monotonic()
+    r = await _request_with_key_failover(
+        f"{_backend_url()}/chat/completions", cc_body, headers, api_key)
+    duration = (time.monotonic() - start_t) * 1000
+
     if r.status_code >= 400:
         logger.error("Upstream error %d: %s", r.status_code, r.text[:500])
+        if state.circuit_breaker:
+            state.circuit_breaker.record_failure()
+        state.failure_count += 1
+        if state.plugin_registry:
+            ectx = _build_plugin_ctx(req_id, "http", model, api_key, stream)
+            ectx.status_code = r.status_code
+            ectx.error = r.text[:200]
+            ectx.duration_ms = duration
+            await state.plugin_registry.on_error(ectx)
         return JSONResponse({"error": {"message": "upstream error",
                                        "status": r.status_code}},
                             status_code=502)
 
+    if state.circuit_breaker:
+        state.circuit_breaker.record_success()
+    state.success_count += 1
+    if state.plugin_registry:
+        rctx = _build_plugin_ctx(req_id, "http", model, api_key, stream)
+        rctx.status_code = r.status_code
+        rctx.duration_ms = duration
+        await state.plugin_registry.on_response(rctx)
     resp = cc_to_response(r.json(), model)
     state.store.put(resp["id"], {**resp, "_original_input": body.get("input", [])})
     return JSONResponse(resp)
@@ -178,7 +310,10 @@ async def responses_ws(ws: WebSocket):
     if auth:
         api_key = _api_key(auth)
     if not api_key:
-        api_key = state.config.provider.effective_api_key()
+        if state.key_rotator:
+            api_key = state.key_rotator.next_key()
+        else:
+            api_key = state.config.provider.effective_api_key()
 
     try:
         while True:
@@ -189,13 +324,36 @@ async def responses_ws(ws: WebSocket):
                 continue
 
             state.request_count += 1
+            state.last_request_time = time.time()
+            # Rotate key per message when no client auth header
+            if not auth and state.key_rotator:
+                api_key = state.key_rotator.next_key()
             body = state.store.resolve_input(body)
             model = body.get("model", state.config.provider.default_model)
-            cc_body = build_cc_request(body)
+            cc_body = build_cc_request(
+                body,
+                compaction_enabled=state.config.compaction.enabled,
+                compaction_max_messages=state.config.compaction.max_messages,
+                compaction_keep_last=state.config.compaction.keep_last,
+            )
             cc_body["model"] = model
             cc_body["stream"] = True
             cc_body = state.adapter.adjust_request(cc_body)
             headers = _cc_headers(api_key)
+
+            if state.circuit_breaker and not state.circuit_breaker.can_execute():
+                error_resp = {
+                    "id": generate_response_id(), "object": "response",
+                    "created_at": int(time.time()), "model": model,
+                    "status": "failed", "output": [],
+                    "usage": {"input_tokens": 0, "output_tokens": 0,
+                              "total_tokens": 0},
+                    "error": {"message": "Circuit breaker open",
+                              "code": "circuit_open"},
+                }
+                await ws.send_text(json.dumps(
+                    {"type": "response.failed", "response": error_resp}))
+                continue
 
             rid = generate_response_id()
             mid = f"msg_{uuid.uuid4().hex[:24]}"
@@ -250,6 +408,9 @@ async def responses_ws(ws: WebSocket):
                             }
             except Exception as e:
                 logger.error("WS upstream error: %s", e)
+                if state.circuit_breaker:
+                    state.circuit_breaker.record_failure()
+                state.failure_count += 1
                 error_resp = {
                     "id": rid, "object": "response", "created_at": now,
                     "model": model, "status": "failed",
@@ -264,6 +425,9 @@ async def responses_ws(ws: WebSocket):
                 continue
 
             # Finish text
+            if state.circuit_breaker:
+                state.circuit_breaker.record_success()
+            state.success_count += 1
             await ws.send_text(json.dumps({
                 "type": "response.output_text.done", "output_index": 0,
                 "content_index": 0, "text": full_text}))
@@ -341,7 +505,7 @@ async def models():
 @app.get("/health")
 async def health(request: Request):
     state = _state()
-    result = {
+    result: dict[str, Any] = {
         "status": "ok",
         "proxy": "codex-proxy",
         "version": __version__,
@@ -367,7 +531,7 @@ async def status():
     state = _state()
     provider = state.config.provider
     uptime = int(time.time() - state.start_time)
-    return JSONResponse({
+    result = {
         "proxy": "codex-proxy",
         "version": __version__,
         "status": "running",
@@ -385,27 +549,69 @@ async def status():
             "host": state.config.server.host,
             "port": state.config.server.port,
         },
-    })
+    }
+    if state.circuit_breaker:
+        result["circuit_breaker"] = state.circuit_breaker.get_status()
+    if state.key_rotator:
+        result["key_rotation"] = {
+            "total_keys": len(state.key_rotator._keys),
+            "keys": state.key_rotator.get_status(),
+        }
+    if state.plugin_registry:
+        result["plugins"] = {
+            "enabled": True,
+            "loaded": state.plugin_registry.list_plugins(),
+        }
+    return JSONResponse(result)
+
+
+def reload_config_internal(state: AppState) -> tuple[str, str]:
+    """Internal config reload — updates state in-place.
+
+    Returns a tuple of (display_name, default_model).
+    """
+    from .config import load_config
+    new_config = load_config()
+    state.config = new_config
+    state.adapter = get_adapter(new_config.provider.name)
+    if (new_config.store.ttl_seconds != state.store.ttl_seconds or
+            new_config.store.max_entries != state.store.max_entries):
+        state.store = ResponseStore(
+            ttl_seconds=new_config.store.ttl_seconds,
+            max_entries=new_config.store.max_entries,
+        )
+    cb_config = new_config.circuit_breaker
+    state.circuit_breaker = CircuitBreaker(
+        failure_threshold=cb_config.failure_threshold,
+        recovery_timeout=cb_config.recovery_timeout,
+    ) if cb_config.enabled else None
+    keys = new_config.provider.effective_api_keys()
+    if len(keys) > 1:
+        state.key_rotator = KeyRotator(
+            keys=keys,
+            failure_threshold=cb_config.failure_threshold,
+            recovery_timeout=cb_config.recovery_timeout,
+        )
+    else:
+        state.key_rotator = None
+    state.plugin_registry = _build_plugin_registry(new_config)
+    return new_config.provider.display_name, new_config.provider.default_model
 
 
 @app.post("/reload")
 async def reload_config():
     """Reload config from disk without restarting."""
-    from .config import load_config
     state = _state()
+    old_registry = state.plugin_registry
     try:
-        new_config = load_config()
-        state.config = new_config
-        state.adapter = get_adapter(new_config.provider.name)
-        if (new_config.store.ttl_seconds != state.store.ttl_seconds or
-                new_config.store.max_entries != state.store.max_entries):
-            state.store = ResponseStore(
-                ttl_seconds=new_config.store.ttl_seconds,
-                max_entries=new_config.store.max_entries,
-            )
+        display_name, default_model = reload_config_internal(state)
+        if old_registry:
+            await old_registry.on_shutdown()
+        if state.plugin_registry:
+            await state.plugin_registry.on_startup(state.config)
         logger.info("Config reloaded successfully")
-        return {"status": "reloaded", "provider": new_config.provider.display_name,
-                "model": new_config.provider.default_model}
+        return {"status": "reloaded", "provider": display_name,
+                "model": default_model}
     except Exception as e:
         logger.error("Config reload failed: %s", e)
         return JSONResponse(
@@ -414,7 +620,7 @@ async def reload_config():
         )
 
 
-def run(config: ProxyConfig) -> None:
+def run(config: ProxyConfig, *, tui: bool = False) -> None:
     """Run the proxy server."""
     configure(config)
     level = getattr(logging, config.server.log_level.upper(), logging.WARNING)
@@ -426,9 +632,16 @@ def run(config: ProxyConfig) -> None:
         fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
         logging.getLogger("codex-proxy").addHandler(fh)
     logger.info("codex-proxy v%s starting", __version__)
-    print(f"  codex-proxy v{__version__}")
-    print(f"  http://{config.server.host}:{config.server.port}")
-    print(f"  backend  {config.provider.display_name} ({config.provider.base_url})")
-    print(f"  models   {', '.join(config.provider.models)}")
+
+    if tui:
+        from .tui import start_tui
+        start_tui(app.state.proxy)
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    else:
+        print(f"  codex-proxy v{__version__}")
+        print(f"  http://{config.server.host}:{config.server.port}")
+        print(f"  backend  {config.provider.display_name} ({config.provider.base_url})")
+        print(f"  models   {', '.join(config.provider.models)}")
+
     uvicorn.run(app, host=config.server.host, port=config.server.port,
                 log_level=config.server.log_level)

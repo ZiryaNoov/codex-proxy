@@ -6,14 +6,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import load_config, write_example_config, DEFAULT_CONFIG
+from .config import DEFAULT_CONFIG, load_config, write_example_config
 from .server import run
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="codex-proxy",
-        description="Responses API → Chat Completions bridge for Codex CLI",
+        description="Responses API to Chat Completions bridge for Codex CLI",
     )
     ap.add_argument("--config", "-c", type=str, default=None,
                     help=f"Config file path (default: {DEFAULT_CONFIG})")
@@ -25,6 +25,8 @@ def main() -> None:
                     help="Write example config and exit")
     ap.add_argument("--print-config", action="store_true",
                     help="Print resolved config and exit")
+    ap.add_argument("--tui", "-t", action="store_true",
+                    help="Launch interactive Rich TUI dashboard")
     args = ap.parse_args()
 
     if args.init:
@@ -46,6 +48,10 @@ def main() -> None:
         print(f"  base_url: {config.provider.base_url}")
         print(f"  models: {', '.join(config.provider.models)}")
         print(f"  api_key: {'***' if config.provider.effective_api_key() else '(empty)'}")
+        print(f"  key_pool: {len(config.provider.effective_api_keys())} key(s)")
+        print(f"  circuit_breaker: {'enabled' if config.circuit_breaker.enabled else 'disabled'} (threshold={config.circuit_breaker.failure_threshold}, timeout={config.circuit_breaker.recovery_timeout}s)")
+        print(f"  compaction: {'enabled' if config.compaction.enabled else 'disabled'} (max_messages={config.compaction.max_messages}, keep_last={config.compaction.keep_last})")
+        print(f"  plugins: {'enabled' if config.plugins.enabled else 'disabled'} ({len(config.plugins.plugins)} configured)")
         sys.exit(0)
 
     if not config.provider.effective_api_key():
@@ -53,7 +59,7 @@ def main() -> None:
         print(f"  Set api_key or api_key_env in {DEFAULT_CONFIG}")
         print("  Or set CODEX_PROXY_API_KEY / OPENAI_API_KEY env var")
 
-    run(config)
+    run(config, tui=args.tui)
 
 
 if __name__ == "__main__":

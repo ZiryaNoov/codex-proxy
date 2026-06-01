@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 
+from .compaction import compact_messages
 
 # ── Responses API input -> Chat Completions messages ────────────────────
 
@@ -88,10 +89,21 @@ def convert_tools(tools: list | None) -> list | None:
 
 # ── Request builder ─────────────────────────────────────────────────────
 
-def build_cc_request(body: dict) -> dict:
+def build_cc_request(
+    body: dict,
+    compaction_enabled: bool = True,
+    compaction_max_messages: int = 50,
+    compaction_keep_last: int = 20,
+) -> dict:
     """Parse Responses API body, return Chat Completions request dict."""
     model = body.get("model", "glm-5.1")
     messages = input_to_messages(body.get("input"), body.get("instructions"))
+    if compaction_enabled:
+        messages = compact_messages(
+            messages,
+            max_messages=compaction_max_messages,
+            keep_last=compaction_keep_last,
+        )
     cc: dict = {"model": model, "messages": messages,
                 "stream": body.get("stream", True)}
 
@@ -118,8 +130,12 @@ def build_cc_request(body: dict) -> dict:
 def unwrap_envelope(raw: str) -> dict:
     """Parse JSON, unwrap Realtime API envelope if present."""
     body = json.loads(raw)
+    if not isinstance(body, dict):
+        return {}
     if body.get("type") == "response.create":
-        return body.get("response") or body
+        res = body.get("response")
+        if isinstance(res, dict):
+            return res
     return body
 
 

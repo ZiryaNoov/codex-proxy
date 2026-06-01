@@ -10,7 +10,7 @@ from pathlib import Path
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore[import-not-found]
 
 DEFAULT_DIR = Path.home() / ".codex-proxy"
 DEFAULT_CONFIG = DEFAULT_DIR / "config.toml"
@@ -24,6 +24,8 @@ class ProviderConfig:
     base_url: str = "https://api.z.ai/api/paas/v4"
     api_key: str = ""
     api_key_env: str = ""  # env var name to read key from
+    api_keys: list[str] = field(default_factory=list)
+    api_keys_env: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=lambda: ["glm-5.1", "glm-5", "glm-4.7"])
     default_model: str = "glm-5.1"
     stream: bool = True
@@ -35,6 +37,21 @@ class ProviderConfig:
         if self.api_key_env:
             return os.environ.get(self.api_key_env, "")
         return ""
+
+    def effective_api_keys(self) -> list[str]:
+        """Return the full resolved key pool."""
+        keys: list[str] = []
+        if self.api_keys:
+            keys.extend(self.api_keys)
+        for env_name in self.api_keys_env:
+            val = os.environ.get(env_name, "")
+            if val:
+                keys.append(val)
+        if not keys:
+            single = self.effective_api_key()
+            if single:
+                keys.append(single)
+        return keys
 
 
 @dataclass
@@ -52,10 +69,33 @@ class StoreConfig:
 
 
 @dataclass
+class CircuitBreakerConfig:
+    enabled: bool = True
+    failure_threshold: int = 5
+    recovery_timeout: float = 30.0
+
+
+@dataclass
+class CompactionConfig:
+    enabled: bool = True
+    max_messages: int = 50
+    keep_last: int = 20
+
+
+@dataclass
+class PluginConfig:
+    enabled: bool = False
+    plugins: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ProxyConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     store: StoreConfig = field(default_factory=StoreConfig)
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    plugins: PluginConfig = field(default_factory=PluginConfig)
 
 
 def load_config(path: Path | None = None) -> ProxyConfig:
@@ -80,6 +120,9 @@ def load_config(path: Path | None = None) -> ProxyConfig:
     server_raw = raw.get("server", {})
     provider_raw = raw.get("provider", {})
     store_raw = raw.get("store", {})
+    cb_raw = raw.get("circuit_breaker", {})
+    comp_raw = raw.get("compaction", {})
+    plugins_raw = raw.get("plugins", {})
 
     server = ServerConfig(
         host=server_raw.get("host", "127.0.0.1"),
@@ -94,6 +137,8 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         base_url=provider_raw.get("base_url", "https://api.z.ai/api/paas/v4"),
         api_key=provider_raw.get("api_key", ""),
         api_key_env=provider_raw.get("api_key_env", ""),
+        api_keys=provider_raw.get("api_keys", []),
+        api_keys_env=provider_raw.get("api_keys_env", []),
         models=provider_raw.get("models", ["glm-5.1", "glm-5", "glm-4.7"]),
         default_model=provider_raw.get("default_model", "glm-5.1"),
         stream=provider_raw.get("stream", True),
@@ -105,7 +150,28 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         max_entries=store_raw.get("max_entries", 100),
     )
 
-    return ProxyConfig(server=server, provider=provider, store=store)
+    circuit_breaker = CircuitBreakerConfig(
+        enabled=cb_raw.get("enabled", True),
+        failure_threshold=cb_raw.get("failure_threshold", 5),
+        recovery_timeout=cb_raw.get("recovery_timeout", 30.0),
+    )
+
+    compaction = CompactionConfig(
+        enabled=comp_raw.get("enabled", True),
+        max_messages=comp_raw.get("max_messages", 50),
+        keep_last=comp_raw.get("keep_last", 20),
+    )
+
+    plugins = PluginConfig(
+        enabled=plugins_raw.get("enabled", False),
+        plugins=plugins_raw.get("plugins", []),
+    )
+
+    return ProxyConfig(
+        server=server, provider=provider, store=store,
+        circuit_breaker=circuit_breaker, compaction=compaction,
+        plugins=plugins,
+    )
 
 
 def write_example_config(path: Path | None = None) -> Path:
@@ -125,6 +191,22 @@ log_level = "warning"    # debug, info, warning, error
 ttl_seconds = 600         # response cache TTL (10 min)
 max_entries = 100         # max cached responses
 
+[circuit_breaker]
+enabled = true             # protect upstream from cascading failures
+failure_threshold = 5      # consecutive failures before opening circuit
+recovery_timeout = 30.0    # seconds before trying half-open recovery
+
+[compaction]
+enabled = true             # auto-trim long conversations
+max_messages = 50          # trigger compaction above this count
+keep_last = 20             # recent messages to preserve
+
+[plugins]
+enabled = true             # enable hook-based middleware plugins
+plugins = [
+    "codex_proxy.plugins_builtin.LoggingPlugin",  # built-in structured logger
+]
+
 [provider]
 # Provider: Z.AI (GLM models)
 name = "zai"
@@ -132,6 +214,8 @@ display_name = "Z.AI"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key = ""             # or set api_key_env below
 api_key_env = "OPENAI_API_KEY"  # reads from env var
+# api_keys = ["sk-key1", "sk-key2", "sk-key3"]  # multi-key rotation
+# api_keys_env = ["OPENAI_API_KEY_1", "OPENAI_API_KEY_2"]
 models = ["glm-5.1", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5-air"]
 default_model = "glm-5.1"
 
@@ -176,6 +260,54 @@ default_model = "glm-5.1"
 # api_key_env = "FIREWORKS_API_KEY"
 # models = ["accounts/fireworks/models/llama4-maverick-instruct-basic"]
 # default_model = "accounts/fireworks/models/llama4-maverick-instruct-basic"
+
+# [provider]
+# name = "anthropic"
+# display_name = "Anthropic"
+# base_url = "https://api.anthropic.com/v1"
+# api_key_env = "ANTHROPIC_API_KEY"
+# models = ["claude-sonnet-4-20250514"]
+# default_model = "claude-sonnet-4-20250514"
+
+# [provider]
+# name = "gemini"
+# display_name = "Google Gemini"
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# api_key_env = "GEMINI_API_KEY"
+# models = ["gemini-2.5-flash"]
+# default_model = "gemini-2.5-flash"
+
+# [provider]
+# name = "deepseek"
+# display_name = "DeepSeek"
+# base_url = "https://api.deepseek.com/v1"
+# api_key_env = "DEEPSEEK_API_KEY"
+# models = ["deepseek-chat", "deepseek-reasoner"]
+# default_model = "deepseek-chat"
+
+# [provider]
+# name = "mistral"
+# display_name = "Mistral AI"
+# base_url = "https://api.mistral.ai/v1"
+# api_key_env = "MISTRAL_API_KEY"
+# models = ["mistral-large-latest"]
+# default_model = "mistral-large-latest"
+
+# [provider]
+# name = "cohere"
+# display_name = "Cohere"
+# base_url = "https://api.cohere.com/compatibility/v1"
+# api_key_env = "CO_API_KEY"
+# models = ["command-a-03-2025"]
+# default_model = "command-a-03-2025"
+
+# [provider]
+# name = "nvidia"
+# display_name = "NVIDIA NIM"
+# base_url = "https://integrate.api.nvidia.com/v1"
+# api_key_env = "NVIDIA_API_KEY"
+# models = ["nvidia/llama-3.1-nemotron-ultra-253b-v1"]
+# default_model = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
 """
     target.write_text(content, encoding="utf-8")
     return target
