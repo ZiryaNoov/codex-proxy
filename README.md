@@ -145,29 +145,9 @@ codex --model glm-5.1 "say hello"
 
 Launch with `codex-proxy --tui` to see a live dashboard:
 
-```
-  codex-proxy v3.1.0   uptime 00:03:16
-┌─────────────────────────── Provider ───────────────────────────┐
-│  name    Z.AI                                                  │
-│  url     https://api.z.ai/api/paas/v4                          │
-│  model   glm-5.1                                               │
-│  models  glm-5.1, glm-5, glm-4.7, glm-4.6, glm-4.5-air        │
-└────────────────────────────────────────────────────────────────┘
-┌───────────────────── Circuit Breaker ──────────────────────────┐
-│  state      closed          failures   0                       │
-│  threshold  5               recovery   30.0s                   │
-└────────────────────────────────────────────────────────────────┘
-┌────────────────────────── Metrics ─────────────────────────────┐
-│  requests      2           success       1                     │
-│  failures      1           success rate  50.0%                 │
-│  last req      95.2s ago   store         1/100                 │
-│  plugins       logging                                     │
-└────────────────────────────────────────────────────────────────┘
-┌─────────────────────────── Logs ───────────────────────────────┐
-│  12:05:01 [INFO] Config and services reloaded via TUI          │
-└────────────────────────────────────────────────────────────────┘
-  r=reload   c=clear store   t=compact   q=quit
-```
+![codex-proxy TUI Dashboard](assets/tui-dashboard.png)
+
+Hotkeys: `r` reload config, `c` clear store, `t` show compaction info, `q` quit.
 
 ## Provider Examples
 
