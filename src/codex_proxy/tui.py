@@ -128,8 +128,8 @@ class Dashboard:
                              border_style="dim")
 
         # Metrics panel
-        total = state.request_count or 1
-        success_rate = (state.success_count / total) * 100 if total > 1 else 0
+        total = state.request_count
+        success_rate = (state.success_count / total) * 100 if total > 0 else 0.0
 
         met_table = Table(show_header=False, box=None, padding=(0, 1))
         met_table.add_column("key", style="dim")
@@ -155,14 +155,14 @@ class Dashboard:
             kp_table.add_column("key", style="dim")
             kp_table.add_column("val")
             for ks in kr.get_status():
-                state_colors = {"closed": "green", "open": "red", "half_open": "yellow"}
-                sc = state_colors.get(ks["state"], "white")
+                sc_colors = {"closed": "green", "open": "red", "half_open": "yellow"}
+                sc = sc_colors.get(ks["state"], "white")
                 kp_table.add_row(
                     ks["key"],
                     Text(ks["state"], style=sc) if ks["errors"] == 0
                     else Text(f"{ks['state']} (err:{ks['errors']})", style=sc),
                 )
-            key_pool_panel = Panel(kp_table, title=f"Key Pool ({len(kr._keys)})",
+            key_pool_panel = Panel(kp_table, title=f"Key Pool ({kr.key_count})",
                                    border_style="magenta")
         else:
             key_pool_panel = None
@@ -214,8 +214,7 @@ class Dashboard:
         elif key == "c":
             from .server import _state
             state = _state()
-            cleared = state.store.size()
-            state.store._store.clear()
+            cleared = state.store.clear()
             self._last_action = f"Store cleared ({cleared} entries removed)"
             self._last_action_time = time.time()
             logging.getLogger("codex-proxy").info("Store cleared via TUI")

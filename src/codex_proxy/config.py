@@ -60,6 +60,13 @@ class ServerConfig:
     port: int = DEFAULT_PORT
     log_level: str = "warning"
     log_dir: Path = field(default_factory=lambda: DEFAULT_DIR / "logs")
+    max_retries: int = 1
+    retry_delay: float = 0.5
+    connect_timeout: float = 10.0
+    read_timeout: float = 180.0
+    admin_token: str = ""
+    max_request_body_bytes: int = 10 * 1024 * 1024  # 10 MB
+    cors_origins: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +96,13 @@ class PluginConfig:
 
 
 @dataclass
+class RateLimitConfig:
+    enabled: bool = False
+    max_requests: int = 60
+    window_seconds: int = 60
+
+
+@dataclass
 class ProxyConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
@@ -96,6 +110,7 @@ class ProxyConfig:
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     plugins: PluginConfig = field(default_factory=PluginConfig)
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
 
 def load_config(path: Path | None = None) -> ProxyConfig:
@@ -129,6 +144,13 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         port=server_raw.get("port", DEFAULT_PORT),
         log_level=server_raw.get("log_level", "warning"),
         log_dir=Path(server_raw.get("log_dir", str(DEFAULT_DIR / "logs"))),
+        max_retries=server_raw.get("max_retries", 1),
+        retry_delay=server_raw.get("retry_delay", 0.5),
+        connect_timeout=server_raw.get("connect_timeout", 10.0),
+        read_timeout=server_raw.get("read_timeout", 180.0),
+        admin_token=server_raw.get("admin_token", ""),
+        max_request_body_bytes=server_raw.get("max_request_body_bytes", 10 * 1024 * 1024),
+        cors_origins=server_raw.get("cors_origins", []),
     )
 
     provider = ProviderConfig(
@@ -167,10 +189,17 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         plugins=plugins_raw.get("plugins", []),
     )
 
+    rl_raw = raw.get("rate_limit", {})
+    rate_limit = RateLimitConfig(
+        enabled=rl_raw.get("enabled", False),
+        max_requests=rl_raw.get("max_requests", 60),
+        window_seconds=rl_raw.get("window_seconds", 60),
+    )
+
     return ProxyConfig(
         server=server, provider=provider, store=store,
         circuit_breaker=circuit_breaker, compaction=compaction,
-        plugins=plugins,
+        plugins=plugins, rate_limit=rate_limit,
     )
 
 
@@ -180,12 +209,19 @@ def write_example_config(path: Path | None = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
 
     content = """\
-# codex-proxy config — https://github.com/ZakPro/codex-proxy
+# codex-proxy config — https://github.com/ZiryaNoov/codex-proxy
 
 [server]
 host = "127.0.0.1"
 port = 4242
 log_level = "warning"    # debug, info, warning, error
+# max_retries = 1         # retries on 5xx/transport errors
+# retry_delay = 0.5       # seconds between retries
+# connect_timeout = 10.0  # seconds to connect to upstream
+# read_timeout = 180.0    # seconds to wait for upstream response
+# admin_token = ""        # if set, /reload and /status require Bearer token
+# max_request_body_bytes = 10485760  # 10 MB max request body
+# cors_origins = ["*"]    # allowed CORS origins (empty = no CORS)
 
 [store]
 ttl_seconds = 600         # response cache TTL (10 min)
@@ -200,6 +236,11 @@ recovery_timeout = 30.0    # seconds before trying half-open recovery
 enabled = true             # auto-trim long conversations
 max_messages = 50          # trigger compaction above this count
 keep_last = 20             # recent messages to preserve
+
+[rate_limit]
+enabled = false            # per-client request throttling
+max_requests = 60          # max requests per window
+window_seconds = 60        # sliding window duration
 
 [plugins]
 enabled = true             # enable hook-based middleware plugins

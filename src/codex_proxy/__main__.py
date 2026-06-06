@@ -36,9 +36,9 @@ def main() -> None:
 
     config = load_config(args.config and Path(args.config))
 
-    if args.host:
+    if args.host is not None:
         config.server.host = args.host
-    if args.port:
+    if args.port is not None:
         config.server.port = args.port
 
     if args.print_config:
@@ -52,6 +52,11 @@ def main() -> None:
         print(f"  circuit_breaker: {'enabled' if config.circuit_breaker.enabled else 'disabled'} (threshold={config.circuit_breaker.failure_threshold}, timeout={config.circuit_breaker.recovery_timeout}s)")
         print(f"  compaction: {'enabled' if config.compaction.enabled else 'disabled'} (max_messages={config.compaction.max_messages}, keep_last={config.compaction.keep_last})")
         print(f"  plugins: {'enabled' if config.plugins.enabled else 'disabled'} ({len(config.plugins.plugins)} configured)")
+        print(f"  server: max_retries={config.server.max_retries}, retry_delay={config.server.retry_delay}s, connect_timeout={config.server.connect_timeout}s, read_timeout={config.server.read_timeout}s")
+        print(f"  rate_limit: {'enabled' if config.rate_limit.enabled else 'disabled'} (max={config.rate_limit.max_requests}/{config.rate_limit.window_seconds}s)")
+        print(f"  admin_token: {'***' if config.server.admin_token else '(empty)'}")
+        print(f"  cors_origins: {config.server.cors_origins or '(none)'}")
+        print(f"  max_request_body: {config.server.max_request_body_bytes} bytes")
         sys.exit(0)
 
     if not config.provider.effective_api_key():

@@ -54,7 +54,7 @@ pytest tests/test_translator.py -v
 pytest tests/ -v --tb=short
 ```
 
-The test suite uses **pytest** with 112+ tests covering the translator, config, store, server, providers, circuit breaker, and compaction modules.
+The test suite uses **pytest** with 217+ tests covering the translator, config, store, server, providers, circuit breaker, compaction, rate limiter, and admin auth modules.
 
 ## Project Structure
 
@@ -67,10 +67,15 @@ codex-proxy/
     translator.py        # Responses API <-> Chat Completions
     config.py            # TOML config loading
     store.py             # In-memory response store
-    providers.py         # Provider-specific adapters
+    providers.py         # Provider-specific adapters (11 providers)
     circuit_breaker.py   # Upstream resilience
     compaction.py        # Context compaction
-  tests/                 # Test suite
+    key_rotation.py      # Multi-key round-robin pool
+    plugins.py           # Hook-based plugin system
+    plugins_builtin.py   # Built-in plugins (LoggingPlugin)
+    rate_limiter.py      # Per-client sliding window rate limiter
+    tui.py               # Rich TUI dashboard
+  tests/                 # Test suite (217+ tests)
   .github/workflows/     # CI/CD pipelines
 ```
 
@@ -118,7 +123,7 @@ Common types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `ci`, `perf`
 
 ## Reporting Issues
 
-- Use [GitHub Issues](https://github.com/ZakPro/codex-proxy/issues) for bugs and feature requests
+- Use [GitHub Issues](https://github.com/ZiryaNoov/codex-proxy/issues) for bugs and feature requests
 - Include your Python version, OS, and relevant config (redact API keys)
 - For bugs, provide steps to reproduce and any error output
 

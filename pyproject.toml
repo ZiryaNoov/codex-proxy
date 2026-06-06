@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-proxy"
-version = "3.1.0"
+version = "4.0.0"
 description = "Responses API to Chat Completions bridge for OpenAI Codex CLI"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "ZakPro", email = "zakarinoo@gmail.com" }]

@@ -111,6 +111,24 @@ class NvidiaAdapter(ProviderAdapter):
         return _strip_stream_options(cc_body)
 
 
+class TogetherAdapter(ProviderAdapter):
+    """Together AI — standard OpenAI-compatible."""
+
+    name: str = "together"
+
+    def adjust_request(self, cc_body: dict) -> dict:
+        return _strip_stream_options(cc_body)
+
+
+class FireworksAdapter(ProviderAdapter):
+    """Fireworks AI — standard OpenAI-compatible."""
+
+    name: str = "fireworks"
+
+    def adjust_request(self, cc_body: dict) -> dict:
+        return _strip_stream_options(cc_body)
+
+
 _ADAPTERS: dict[str, type[ProviderAdapter]] = {
     "ollama": OllamaAdapter,
     "openrouter": OpenRouterAdapter,
@@ -121,6 +139,8 @@ _ADAPTERS: dict[str, type[ProviderAdapter]] = {
     "mistral": MistralAdapter,
     "cohere": CohereAdapter,
     "nvidia": NvidiaAdapter,
+    "together": TogetherAdapter,
+    "fireworks": FireworksAdapter,
 }
 
 

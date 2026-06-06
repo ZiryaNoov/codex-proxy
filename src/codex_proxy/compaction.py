@@ -34,7 +34,7 @@ def compact_messages(
         "role": "system",
         "content": (
             f"[Context compacted: {dropped_count} earlier messages were "
-            "summarized to fit context limits. Continue based on the "
+            "dropped to fit context limits. Continue based on the "
             "remaining conversation.]"
         ),
     }

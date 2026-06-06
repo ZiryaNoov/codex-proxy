@@ -3,6 +3,44 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.0.0] - 2026-06-07
+
+### Fixed
+
+- **`__main__.py`**: `--port 0` and `--host ""` no longer silently ignored (`is not None` check)
+- **`store.py`**: Removed production `assert` that could silently crash with `-O` flag
+- **`compaction.py`**: Compaction notice now says "dropped" instead of misleading "summarized"
+- **`tui.py`**: Success rate now correct after first request (off-by-one fix)
+- **`circuit_breaker.py`**: `get_status()` now includes `last_failure_time` field
+- **`Dockerfile`**: Binds to `0.0.0.0` for container networking
+
+### Changed
+
+- Removed duplicate `_mask_key()` from `server.py` — single source in `key_rotation.py`
+- `KeyRotator` now exposes `key_count` property (no more `_keys` access)
+- `ResponseStore` now exposes `clear()` method (no more `_store` access)
+- `server.py` no longer accesses private `_keys` on `KeyRotator`
+- `tui.py` no longer accesses private `_store` on `ResponseStore`
+- `tui.py` no longer shadows `state_colors` variable name
+- Hardcoded `MAX_RETRIES`, `RETRY_DELAY`, httpx timeouts are now configurable via config
+- Example config URL corrected to `ZiryaNoov/codex-proxy`
+
+### Added
+
+- **CORS middleware** — configurable via `cors_origins` in `[server]` config
+- **Admin authentication** — optional Bearer token on `/reload` and `/status` endpoints
+- **Rate limiting** — per-client sliding window rate limiter (`[rate_limit]` config section)
+- **Request size limits** — configurable `max_request_body_bytes` (default 10MB)
+- **Configurable timeouts** — `connect_timeout`, `read_timeout`, `max_retries`, `retry_delay`
+- **Provider adapters** for Together AI and Fireworks AI (11 adapters total)
+- **`rate_limiter.py`** — new module with `RateLimiter` class
+- **217 tests** (up from 184) with new test files:
+  - `test_rate_limiter.py` — rate limiter unit tests
+  - `test_server_features.py` — rate limiting, admin auth, request size integration tests
+  - `test_edge_cases.py` — compaction edge cases, config TOML, provider adapter registry
+- `pyproject.toml` now includes `readme = "README.md"` for PyPI
 
 ## [3.1.0] - 2026-06-01
 
@@ -28,7 +66,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `--print-config` now shows circuit_breaker and compaction settings
 - MIT `LICENSE` file
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.0.0] - 2026-05-31
 

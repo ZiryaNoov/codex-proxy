@@ -14,14 +14,16 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .circuit_breaker import CircuitBreaker
 from .config import ProxyConfig
-from .key_rotation import KeyRotator
+from .key_rotation import KeyRotator, _mask_key
 from .plugins import PluginContext, PluginRegistry
 from .providers import ProviderAdapter, get_adapter
+from .rate_limiter import RateLimiter
 from .store import ResponseStore
 from .translator import (
     accumulate_tool_call,
@@ -35,9 +37,6 @@ from .translator import (
 )
 
 logger = logging.getLogger("codex-proxy")
-
-MAX_RETRIES = 1
-RETRY_DELAY = 0.5
 
 
 @dataclass
@@ -54,6 +53,7 @@ class AppState:
     last_request_time: float = 0.0
     key_rotator: KeyRotator | None = None
     plugin_registry: PluginRegistry | None = None
+    rate_limiter: RateLimiter | None = None
 
 
 @asynccontextmanager
@@ -78,7 +78,11 @@ def configure(config: ProxyConfig) -> None:
         max_entries=config.store.max_entries,
     )
     client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10, read=180, write=10, pool=30),
+        timeout=httpx.Timeout(
+            connect=config.server.connect_timeout,
+            read=config.server.read_timeout,
+            write=10, pool=30,
+        ),
     )
     adapter = get_adapter(config.provider.name)
     cb_config = config.circuit_breaker
@@ -94,12 +98,26 @@ def configure(config: ProxyConfig) -> None:
             failure_threshold=cb_config.failure_threshold,
             recovery_timeout=cb_config.recovery_timeout,
         )
+    rl_config = config.rate_limit
+    rate_limiter = RateLimiter(
+        max_requests=rl_config.max_requests,
+        window_seconds=rl_config.window_seconds,
+    ) if rl_config.enabled else None
     app.state.proxy = AppState(
         config=config, store=store, client=client,
         adapter=adapter, circuit_breaker=cb, start_time=time.time(),
         key_rotator=key_rotator,
         plugin_registry=_build_plugin_registry(config),
+        rate_limiter=rate_limiter,
     )
+    # CORS middleware (add only if origins configured)
+    if config.server.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.server.cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
 
 def _state() -> AppState:
@@ -108,18 +126,29 @@ def _state() -> AppState:
     return val
 
 
+def _require_admin(authorization: str = Header(default="")) -> None:
+    """Dependency that enforces admin token on protected endpoints."""
+    state = _state()
+    token = state.config.server.admin_token
+    if token and authorization != f"Bearer {token}":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+
+def _client_id(request: Request) -> str:
+    """Extract a client identifier for rate limiting."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _build_plugin_registry(config: ProxyConfig) -> PluginRegistry | None:
     if config.plugins.enabled and config.plugins.plugins:
         registry = PluginRegistry()
         registry.load(config.plugins.plugins)
         return registry
     return None
-
-
-def _mask_key(key: str) -> str:
-    if len(key) <= 7:
-        return "***"
-    return f"{key[:3]}...{key[-4:]}"
 
 
 def _build_plugin_ctx(request_id: str, method: str, model: str,
@@ -156,19 +185,22 @@ def _backend_url() -> str:
 
 
 async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Response:
-    """POST with one retry on 5xx or transport errors."""
-    client = _state().client
-    for attempt in range(MAX_RETRIES + 1):
+    """POST with retry on 5xx or transport errors."""
+    state = _state()
+    max_retries = state.config.server.max_retries
+    retry_delay = state.config.server.retry_delay
+    client = state.client
+    for attempt in range(max_retries + 1):
         try:
             r = await client.post(url, json=json_body, headers=headers)
-            if r.status_code < 500 or attempt == MAX_RETRIES:
+            if r.status_code < 500 or attempt == max_retries:
                 return r
             logger.warning("Upstream 5xx (attempt %d), retrying...", attempt + 1)
         except httpx.TransportError as e:
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 raise
             logger.warning("Transport error (attempt %d): %s, retrying...", attempt + 1, e)
-        await asyncio.sleep(RETRY_DELAY)
+        await asyncio.sleep(retry_delay)
     raise httpx.TransportError("Max retries exceeded")
 
 
@@ -178,7 +210,7 @@ async def _request_with_key_failover(url: str, json_body: dict,
     state = _state()
     if not state.key_rotator:
         return await _post_with_retry(url, json_body, headers)
-    max_attempts = len(state.key_rotator._keys)
+    max_attempts = state.key_rotator.key_count
     r: httpx.Response | None = None
     for _ in range(max_attempts):
         r = await _post_with_retry(url, json_body, headers)
@@ -201,6 +233,25 @@ async def _request_with_key_failover(url: str, json_body: dict,
 async def responses_http(request: Request,
                          authorization: str = Header(default="")):
     state = _state()
+
+    # Rate limiting
+    if state.rate_limiter:
+        cid = _client_id(request)
+        if not state.rate_limiter.allow(cid):
+            return JSONResponse(
+                {"error": {"message": "Rate limit exceeded", "code": "rate_limited"}},
+                status_code=429,
+            )
+
+    # Request size check
+    content_length = request.headers.get("content-length", "0")
+    max_bytes = state.config.server.max_request_body_bytes
+    if int(content_length) > max_bytes:
+        return JSONResponse(
+            {"error": {"message": "Request too large", "code": "request_too_large"}},
+            status_code=413,
+        )
+
     state.request_count += 1
     state.last_request_time = time.time()
 
@@ -527,7 +578,8 @@ async def health(request: Request):
 
 
 @app.get("/status")
-async def status():
+async def status(authorization: str = Header(default="")):
+    _require_admin(authorization)
     state = _state()
     provider = state.config.provider
     uptime = int(time.time() - state.start_time)
@@ -554,7 +606,7 @@ async def status():
         result["circuit_breaker"] = state.circuit_breaker.get_status()
     if state.key_rotator:
         result["key_rotation"] = {
-            "total_keys": len(state.key_rotator._keys),
+            "total_keys": state.key_rotator.key_count,
             "keys": state.key_rotator.get_status(),
         }
     if state.plugin_registry:
@@ -562,6 +614,8 @@ async def status():
             "enabled": True,
             "loaded": state.plugin_registry.list_plugins(),
         }
+    if state.rate_limiter:
+        result["rate_limit"] = state.rate_limiter.get_status()
     return JSONResponse(result)
 
 
@@ -594,13 +648,19 @@ def reload_config_internal(state: AppState) -> tuple[str, str]:
         )
     else:
         state.key_rotator = None
+    rl_config = new_config.rate_limit
+    state.rate_limiter = RateLimiter(
+        max_requests=rl_config.max_requests,
+        window_seconds=rl_config.window_seconds,
+    ) if rl_config.enabled else None
     state.plugin_registry = _build_plugin_registry(new_config)
     return new_config.provider.display_name, new_config.provider.default_model
 
 
 @app.post("/reload")
-async def reload_config():
+async def reload_config(authorization: str = Header(default="")):
     """Reload config from disk without restarting."""
+    _require_admin(authorization)
     state = _state()
     old_registry = state.plugin_registry
     try:

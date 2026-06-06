@@ -157,7 +157,7 @@ class TestKeyRotationIntegration:
         configure(config)
         state = _state()
         assert state.key_rotator is not None
-        assert len(state.key_rotator._keys) == 2
+        assert state.key_rotator.key_count == 2
 
     def test_status_includes_key_rotation(self, client):
         config = ProxyConfig(provider=ProviderConfig(api_keys=["k1", "k2"]))

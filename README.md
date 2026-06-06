@@ -33,7 +33,7 @@ and a live dashboard, codex-proxy is for you.
 ## Architecture
 
 ```
-                      codex-proxy v3.1.0
+                      codex-proxy v4.0.0
  ┌────────────┐      ┌──────────────────────────┐      ┌──────────────────┐
  │            │      │                          │      │                  │
  │  Codex CLI │─────>│    FastAPI server        │─────>│   LLM Provider   │
@@ -45,6 +45,7 @@ and a live dashboard, codex-proxy is for you.
   Responses API      │  . Key Rotator            │
   protocol           │  . Compaction Engine       │      Chat Completions
                      │  . Plugin Registry         │      protocol
+                     │  . Rate Limiter            │
                      │  . Provider Adapters       │
                      └──────────────────────────┘
 ```
@@ -59,7 +60,11 @@ and a live dashboard, codex-proxy is for you.
 - **Reasoning passthrough** -- forwards thinking/reasoning tokens
 - **Tool calls** -- full function calling support (definitions + results)
 - **Multi-turn** -- `previous_response_id` via in-memory response store
-- **Auto-retry** -- one retry on 5xx/transport errors
+- **Auto-retry** -- configurable retries on 5xx/transport errors
+- **Rate limiting** -- per-client sliding window rate limiter
+- **Admin auth** -- optional Bearer token on `/reload` and `/status` endpoints
+- **CORS support** -- configurable allowed origins
+- **Request size limits** -- configurable max body size (default 10MB)
 
 ### Reliability
 
@@ -79,7 +84,7 @@ and a live dashboard, codex-proxy is for you.
 - **Provider adapters** -- per-provider header/request normalization
 - **Docker-ready** -- Dockerfile and Compose file included
 - **pip-installable** -- `pip install codex-proxy`, run with `codex-proxy` CLI
-- **184+ tests** -- comprehensive test suite covering all modules
+- **217+ tests** -- comprehensive test suite covering all modules
 
 ## Quick Start
 
@@ -360,6 +365,13 @@ Config file: `~/.codex-proxy/config.toml`
 | `port` | int | `4242` | Bind port |
 | `log_level` | string | `"warning"` | Log verbosity: `debug`, `info`, `warning`, `error` |
 | `log_dir` | string | `~/.codex-proxy/logs` | Directory for debug log files |
+| `max_retries` | int | `1` | Retries on 5xx/transport errors |
+| `retry_delay` | float | `0.5` | Seconds between retries |
+| `connect_timeout` | float | `10.0` | Seconds to connect to upstream |
+| `read_timeout` | float | `180.0` | Seconds to wait for upstream response |
+| `admin_token` | string | `""` | Bearer token for `/reload` and `/status` (empty = no auth) |
+| `max_request_body_bytes` | int | `10485760` | Max request body size (10MB) |
+| `cors_origins` | list | `[]` | Allowed CORS origins (empty = no CORS headers) |
 
 ### `[store]`
 
@@ -406,6 +418,14 @@ Config file: `~/.codex-proxy/config.toml`
 |---|---|---|---|
 | `enabled` | bool | `false` | Enable/disable plugin system |
 | `plugins` | list | `[]` | Dotted paths to plugin classes |
+
+### `[rate_limit]`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enable/disable per-client rate limiting |
+| `max_requests` | int | `60` | Max requests per client per window |
+| `window_seconds` | int | `60` | Sliding window duration in seconds |
 
 ## Environment Variables
 
@@ -487,7 +507,7 @@ pip install -e ".[dev,tui]"
 ### Testing
 
 ```bash
-pytest tests/ -v    # 184+ tests
+pytest tests/ -v    # 217+ tests
 ```
 
 ### Linting & Type Checking

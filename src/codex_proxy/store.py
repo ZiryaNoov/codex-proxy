@@ -30,7 +30,8 @@ class ResponseStore:
             del self._store[response_id]
             return None
         res = entry["response"]
-        assert isinstance(res, dict)
+        if not isinstance(res, dict):
+            return None
         return res
 
     def resolve_input(self, body: dict) -> dict:
@@ -90,6 +91,12 @@ class ResponseStore:
 
     def size(self) -> int:
         return len(self._store)
+
+    def clear(self) -> int:
+        """Clear all entries. Returns count of cleared entries."""
+        count = len(self._store)
+        self._store.clear()
+        return count
 
     def entries(self) -> list[tuple[str, float]]:
         """Return list of (response_id, age_seconds) for all cached entries."""

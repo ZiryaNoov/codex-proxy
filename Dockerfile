@@ -6,4 +6,5 @@ RUN pip install --no-cache-dir .
 EXPOSE 4242
 ENV CODEX_PROXY_API_KEY=""
 ENV CODEX_PROXY_BASE_URL=""
-CMD ["codex-proxy"]
+ENV CODEX_PROXY_HOST="0.0.0.0"
+CMD ["codex-proxy", "--host", "0.0.0.0"]

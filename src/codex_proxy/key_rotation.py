@@ -106,3 +106,8 @@ class KeyRotator:
         self._keys = keys
         self._index = 0
         self._rebuild_entries(keys)
+
+    @property
+    def key_count(self) -> int:
+        """Number of keys in the pool."""
+        return len(self._keys)
