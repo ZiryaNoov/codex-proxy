@@ -1437,10 +1437,9 @@ async def api_router_status(authorization: str = Header(default="")):
 @app.get("/dashboard")
 async def dashboard_page():
     """Serve the embedded web dashboard."""
-    from fastapi import HTMLResponse
-    from fastapi.responses import HTMLResponse as HR
+    from fastapi.responses import HTMLResponse
     from .dashboard import DASHBOARD_HTML
-    return HR(content=DASHBOARD_HTML)
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 def run(config: ProxyConfig, *, tui: bool = False) -> None:
@@ -1455,6 +1454,18 @@ def run(config: ProxyConfig, *, tui: bool = False) -> None:
         fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
         logging.getLogger("codex-proxy").addHandler(fh)
     logger.info("codex-proxy v%s starting", __version__)
+
+    # v5 async initialization (DB, auth, router)
+    if config.is_v5_mode:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.run_until_complete(configure_async(config))
 
     if tui:
         from .tui import start_tui
