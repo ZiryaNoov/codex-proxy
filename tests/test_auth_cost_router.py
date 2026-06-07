@@ -181,6 +181,29 @@ class TestCostCalculation:
 
         asyncio.run(_test())
 
+    def test_seed_pricing_to_db(self):
+        """Test seeding KNOWN_PRICING into DB."""
+        async def _test():
+            from codex_proxy.db import init_db
+            from codex_proxy.cost import seed_pricing_to_db, KNOWN_PRICING
+
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+                db_path = f.name
+            engine, factory = await init_db(f"sqlite+aiosqlite:///{db_path}")
+
+            # First seed — should insert all models
+            count = await seed_pricing_to_db(factory)
+            assert count == len(KNOWN_PRICING)
+
+            # Second seed — should be idempotent (0 new)
+            count2 = await seed_pricing_to_db(factory)
+            assert count2 == 0
+
+            await engine.dispose()
+            os.unlink(db_path)
+
+        asyncio.run(_test())
+
 
 # ── Smart Router tests ──────────────────────────────────────────────────
 

@@ -105,3 +105,42 @@ def _compute(input_tokens: int, output_tokens: int,
     """Compute cost from token counts and per-million prices."""
     return (input_tokens * input_price_per_m / 1_000_000) + \
            (output_tokens * output_price_per_m / 1_000_000)
+
+
+async def seed_pricing_to_db(db_session_factory, default_provider_id: str | None = None) -> int:
+    """Seed KNOWN_PRICING into the DB models table.
+
+    Only inserts models that don't already exist (idempotent).
+    Returns count of models inserted.
+    """
+    from .db import crud_providers, crud_logs
+    from sqlalchemy import func, select
+    from .db.models import models as models_table
+
+    inserted = 0
+    async with db_session_factory() as session:
+        # Get or create a default provider for pricing data
+        if not default_provider_id:
+            providers = await crud_providers.list_providers(session)
+            if providers:
+                default_provider_id = providers[0]["id"]
+            else:
+                # Create a generic pricing provider
+                p = await crud_providers.create_provider(
+                    session, name="_pricing", display_name="Pricing Reference",
+                    base_url="", adapter_name="default")
+                default_provider_id = p["id"]
+
+        for model_id, (inp_price, out_price) in KNOWN_PRICING.items():
+            existing = await crud_providers.get_model(session, default_provider_id, model_id)
+            if not existing:
+                await crud_providers.create_model(
+                    session, provider_id=default_provider_id, model_id=model_id,
+                    input_price_per_million=inp_price,
+                    output_price_per_million=out_price,
+                )
+                inserted += 1
+
+    if inserted:
+        logger.info("Seeded %d model prices to DB", inserted)
+    return inserted

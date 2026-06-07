@@ -179,6 +179,14 @@ async def configure_async(config: ProxyConfig) -> None:
         # Seed providers from config into DB
         await _seed_providers_from_config(state)
 
+        # Seed model pricing from KNOWN_PRICING
+        from .cost import seed_pricing_to_db
+        providers_list = await _get_db_providers(state)
+        default_pid = providers_list[0]["id"] if providers_list else None
+        count = await seed_pricing_to_db(state.db_session_factory, default_pid)
+        if count:
+            logger.info("Seeded %d model prices to database", count)
+
     # Initialize auth if enabled (requires database)
     if config.auth.enabled:
         if not state.db_session_factory:
@@ -244,6 +252,15 @@ async def _seed_providers_from_config(state: AppState) -> None:
                         key_prefix=prefix,
                     )
             logger.info("Seeded provider: %s (%d keys)", pcfg.name, len(keys))
+
+
+async def _get_db_providers(state: AppState) -> list[dict]:
+    """Get providers from DB. Returns empty list if no DB."""
+    if not state.db_session_factory:
+        return []
+    from .db import crud_providers
+    async with state.db_session_factory() as session:
+        return await crud_providers.list_providers(session)
 
 
 def _build_providers_map(config: ProxyConfig, primary_client: httpx.AsyncClient) -> dict[str, ProviderState]:
@@ -479,6 +496,64 @@ async def _log_request(state: AppState, request_id: str, model: str,
         logger.warning("Failed to log request: %s", e)
 
 
+async def _check_auth_and_budget(request: Request, state: AppState,
+                                  authorization: str) -> JSONResponse | str:
+    """Check auth token and budget when both auth + DB are enabled.
+
+    Returns user_id string on success, or JSONResponse error on failure.
+    """
+    from fastapi import HTTPException
+    from .auth import decode_token
+
+    if not authorization:
+        return JSONResponse(
+            {"error": {"message": "Authorization required", "code": "auth_required"}},
+            status_code=401)
+
+    token = authorization
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    try:
+        payload = decode_token(token, state.config.auth.secret_key)
+    except ValueError as e:
+        return JSONResponse(
+            {"error": {"message": str(e), "code": "auth_invalid"}},
+            status_code=401)
+
+    if payload.get("type") != "access":
+        return JSONResponse(
+            {"error": {"message": "Invalid token type", "code": "auth_invalid"}},
+            status_code=401)
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return JSONResponse(
+            {"error": {"message": "Invalid token", "code": "auth_invalid"}},
+            status_code=401)
+
+    # Budget check
+    try:
+        from .db import crud_budgets
+        async with state.db_session_factory() as session:
+            status = await crud_budgets.check_budget_status(session, user_id, 0.0)
+            if not status.get("within_budget", True):
+                return JSONResponse(
+                    {"error": {
+                        "message": "Budget exceeded",
+                        "code": "budget_exceeded",
+                        "daily_limit": status.get("daily_limit"),
+                        "monthly_limit": status.get("monthly_limit"),
+                        "daily_spend": status.get("daily_spend"),
+                        "monthly_spend": status.get("monthly_spend"),
+                    }},
+                    status_code=429)
+    except Exception as e:
+        logger.warning("Budget check failed (allowing request): %s", e)
+
+    return user_id
+
+
 # ── HTTP endpoint ───────────────────────────────────────────────────────
 
 @app.post("/responses")
@@ -494,6 +569,14 @@ async def responses_http(request: Request,
                 {"error": {"message": "Rate limit exceeded", "code": "rate_limited"}},
                 status_code=429,
             )
+
+    # Budget enforcement (auth + DB required)
+    user_id_for_log: str | None = None
+    if state.config.auth.enabled and state.db_session_factory:
+        auth_result = await _check_auth_and_budget(request, state, authorization)
+        if isinstance(auth_result, JSONResponse):
+            return auth_result  # Auth or budget check failed
+        user_id_for_log = auth_result
 
     # Request size check
     content_length = request.headers.get("content-length", "0")
@@ -561,7 +644,8 @@ async def responses_http(request: Request,
                     duration = (time.monotonic() - start_t) * 1000
                     await _log_request(state, req_id, model, "http", ps.config.name,
                                        0, 0, 0, duration, resp.status_code,
-                                       error_body[:200].decode(errors="replace"), True)
+                                       error_body[:200].decode(errors="replace"), True,
+                                       user_id=user_id_for_log)
                     yield f"event: error\ndata: {json.dumps({'error': {'message': 'upstream error', 'status': resp.status_code}})}\n\n"
                     return
 
@@ -583,7 +667,8 @@ async def responses_http(request: Request,
             usage = resp_data.get("usage", {})
             await _log_request(state, req_id, model, "http", ps.config.name,
                                usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-                               0.0, duration, 200, None, True)
+                               0.0, duration, 200, None, True,
+                               user_id=user_id_for_log)
 
         return StreamingResponse(_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -606,7 +691,8 @@ async def responses_http(request: Request,
             ectx.duration_ms = duration
             await state.plugin_registry.on_error(ectx)
         await _log_request(state, req_id, model, "http", ps.config.name,
-                           0, 0, 0, duration, r.status_code, r.text[:200], False)
+                           0, 0, 0, duration, r.status_code, r.text[:200], False,
+                           user_id=user_id_for_log)
         return JSONResponse({"error": {"message": "upstream error",
                                        "status": r.status_code}},
                             status_code=502)
@@ -626,7 +712,8 @@ async def responses_http(request: Request,
     usage = resp.get("usage", {})
     await _log_request(state, req_id, model, "http", ps.config.name,
                        usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-                       0.0, duration, 200, None, False)
+                       0.0, duration, 200, None, False,
+                       user_id=user_id_for_log)
 
     return JSONResponse(resp)
 
@@ -1185,6 +1272,69 @@ async def auth_me(authorization: str = Header(default="")):
     }
 
 
+# ── v5 Budget endpoints ──────────────────────────────────────────────────
+
+@app.get("/auth/budget")
+async def get_my_budget(authorization: str = Header(default="")):
+    """Get current user's budget status."""
+    from fastapi import HTTPException
+    from .auth import decode_token
+
+    state = _state()
+    if not state.config.auth.enabled or not state.db_session_factory:
+        raise HTTPException(status_code=400, detail="Auth + database required")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = decode_token(token, state.config.auth.secret_key)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    user_id = payload.get("sub")
+    from .db import crud_budgets
+    async with state.db_session_factory() as session:
+        status = await crud_budgets.check_budget_status(session, user_id, 0.0)
+        alerts = await crud_budgets.list_unacknowledged_alerts(session, user_id)
+    return JSONResponse({"budget": status, "alerts": alerts})
+
+
+@app.put("/auth/budget")
+async def set_my_budget(request: Request, authorization: str = Header(default="")):
+    """Create or update budget for current user."""
+    from fastapi import HTTPException
+    from .auth import decode_token
+
+    state = _state()
+    if not state.config.auth.enabled or not state.db_session_factory:
+        raise HTTPException(status_code=400, detail="Auth + database required")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = decode_token(token, state.config.auth.secret_key)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    user_id = payload.get("sub")
+    body = await request.json()
+
+    from .db import crud_budgets
+    async with state.db_session_factory() as session:
+        existing = await crud_budgets.get_budget_by_user(session, user_id)
+        if existing:
+            budget = await crud_budgets.update_budget(
+                session, existing["id"],
+                daily_limit=body.get("daily_limit", existing["daily_limit"]),
+                monthly_limit=body.get("monthly_limit", existing["monthly_limit"]),
+            )
+        else:
+            budget = await crud_budgets.create_budget(
+                session, user_id=user_id,
+                daily_limit=body.get("daily_limit"),
+                monthly_limit=body.get("monthly_limit"),
+            )
+    return JSONResponse(budget)
+
+
 # ── v5 Dashboard API endpoints ──────────────────────────────────────────
 
 @app.get("/api/stats")
@@ -1284,6 +1434,15 @@ async def api_router_status(authorization: str = Header(default="")):
     return JSONResponse(state.smart_router.get_status())
 
 
+@app.get("/dashboard")
+async def dashboard_page():
+    """Serve the embedded web dashboard."""
+    from fastapi import HTMLResponse
+    from fastapi.responses import HTMLResponse as HR
+    from .dashboard import DASHBOARD_HTML
+    return HR(content=DASHBOARD_HTML)
+
+
 def run(config: ProxyConfig, *, tui: bool = False) -> None:
     """Run the proxy server."""
     configure(config)
@@ -1310,6 +1469,8 @@ def run(config: ProxyConfig, *, tui: bool = False) -> None:
             print(f"  models    {', '.join(p.models)}")
         if config.is_v5_mode:
             print(f"  mode      v5 (database={config.database.enabled}, auth={config.auth.enabled})")
+            if config.dashboard.enabled:
+                print(f"  dashboard http://{config.server.host}:{config.server.port}/dashboard")
 
     uvicorn.run(app, host=config.server.host, port=config.server.port,
                 log_level=config.server.log_level)
