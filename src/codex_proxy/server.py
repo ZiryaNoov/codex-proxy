@@ -74,6 +74,7 @@ class AppState:
     db_engine: Any | None = None       # sqlalchemy AsyncEngine
     db_session_factory: Any | None = None  # async_sessionmaker
     providers_map: dict[str, ProviderState] = field(default_factory=dict)
+    smart_router: Any | None = None    # SmartRouter when routing enabled
 
 
 @asynccontextmanager
@@ -165,17 +166,38 @@ async def configure_async(config: ProxyConfig) -> None:
     if not config.is_v5_mode:
         return
 
+    state = _state()
+
     # Initialize database if enabled
     if config.database.enabled:
         from .db import init_db
         engine, session_factory = await init_db(config.effective_db_url)
-        state = _state()
         state.db_engine = engine
         state.db_session_factory = session_factory
         logger.info("v5 database enabled: %s", config.effective_db_url.split(":///")[-1])
 
         # Seed providers from config into DB
         await _seed_providers_from_config(state)
+
+    # Initialize auth if enabled (requires database)
+    if config.auth.enabled:
+        if not state.db_session_factory:
+            logger.error("Auth requires database to be enabled. Disabling auth.")
+            config.auth.enabled = False
+        else:
+            from .auth import ensure_secret_key, seed_admin_user
+            ensure_secret_key(config)
+            await seed_admin_user(state.db_session_factory, config)
+            logger.info("v5 auth enabled — admin: %s", config.auth.admin_username)
+
+    # Initialize smart router if enabled
+    if config.router.enabled:
+        from .router import SmartRouter
+        state.smart_router = SmartRouter(
+            strategy=config.router.default_strategy,
+            providers_map=state.providers_map,
+        )
+        logger.info("v5 router enabled — strategy: %s", config.router.default_strategy)
 
     logger.info("v5 mode active — features: database=%s auth=%s router=%s dashboard=%s",
                 config.database.enabled, config.auth.enabled,
@@ -255,9 +277,16 @@ def _build_providers_map(config: ProxyConfig, primary_client: httpx.AsyncClient)
 def _resolve_provider(state: AppState, model: str) -> tuple[ProviderState, str]:
     """Resolve which provider to use for a given model.
 
-    Returns (ProviderState, resolved_model).
-    Falls back to primary provider if no match found.
+    Uses the SmartRouter when enabled, otherwise falls back to
+    simple model-to-provider matching.
     """
+    # Use smart router if enabled
+    if state.smart_router and state.config.router.enabled:
+        provider_name, _ = state.smart_router.select_provider(
+            model, state.providers_map, state.db_session_factory)
+        if provider_name in state.providers_map:
+            return state.providers_map[provider_name], model
+
     # Try to find a provider that has this model
     for name, ps in state.providers_map.items():
         if model in ps.config.models:
@@ -394,23 +423,52 @@ async def _log_request(state: AppState, request_id: str, model: str,
                        cost_usd: float, latency_ms: float,
                        status_code: int | None, error: str | None,
                        is_stream: bool, user_id: str | None = None) -> None:
-    """Log a request to the database (non-blocking, best-effort)."""
+    """Log a request to the database (non-blocking, best-effort).
+
+    Calculates real cost from model pricing when possible.
+    Records latency in the smart router for adaptive routing.
+    """
+    # Record latency for smart router
+    if state.smart_router and provider_name:
+        success = status_code is None or status_code < 400
+        state.smart_router.record_latency(provider_name, latency_ms, success)
+
     if not state.db_session_factory:
         return
+
+    # Calculate real cost if not provided
+    actual_cost = cost_usd
+    if actual_cost == 0.0 and (input_tokens > 0 or output_tokens > 0):
+        try:
+            from .cost import calculate_cost
+            actual_cost = await calculate_cost(
+                model, input_tokens, output_tokens, state.db_session_factory)
+        except Exception:
+            pass
+
     try:
-        from .db import crud_logs
+        from .db import crud_logs, crud_providers
         async with state.db_session_factory() as session:
+            # Resolve provider_id from provider_name
+            provider_id = None
+            try:
+                p = await crud_providers.get_provider_by_name(session, provider_name)
+                if p:
+                    provider_id = p["id"]
+            except Exception:
+                pass
+
             await crud_logs.insert_log(
                 session,
                 user_id=user_id,
-                provider_id=None,  # TODO: resolve from provider_name
+                provider_id=provider_id,
                 request_id=request_id,
                 model=model,
                 method=method,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=input_tokens + output_tokens,
-                cost_usd=cost_usd,
+                cost_usd=actual_cost,
                 latency_ms=latency_ms,
                 status_code=status_code,
                 error_message=error,
@@ -855,6 +913,11 @@ async def status(authorization: str = Header(default="")):
         result["mode"] = "v5"
         result["providers_count"] = len(state.providers_map)
         result["database"] = state.config.database.enabled
+        result["auth"] = state.config.auth.enabled
+        result["router"] = state.config.router.enabled
+        result["dashboard"] = state.config.dashboard.enabled
+    if state.smart_router:
+        result["router_status"] = state.smart_router.get_status()
     if state.circuit_breaker:
         result["circuit_breaker"] = state.circuit_breaker.get_status()
     if state.key_rotator:
@@ -933,6 +996,292 @@ async def reload_config(authorization: str = Header(default="")):
             {"status": "error", "message": str(e)},
             status_code=500,
         )
+
+
+# ── v5 Auth endpoints ────────────────────────────────────────────────────
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    """Authenticate user and return JWT tokens."""
+    from fastapi import HTTPException
+    from .auth import verify_password, create_access_token, create_refresh_token
+
+    state = _state()
+    if not state.config.auth.enabled:
+        raise HTTPException(status_code=400, detail="Auth not enabled")
+
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+
+    # Look up user in DB
+    if not state.db_session_factory:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    from .db import crud_users
+    async with state.db_session_factory() as session:
+        user = await crud_users.get_user_by_username(session, username)
+
+    if not user or not user.get("is_active"):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token_data = {"sub": user["id"], "username": user["username"], "role": user["role"]}
+    access_token = create_access_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.access_token_expire_minutes)
+    refresh_token = create_refresh_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.refresh_token_expire_days)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": state.config.auth.access_token_expire_minutes * 60,
+        "user": {"id": user["id"], "username": user["username"], "role": user["role"]},
+    }
+
+
+@app.post("/auth/signup")
+async def auth_signup(request: Request):
+    """Register a new user. Only admins can create users (or first user is auto-admin)."""
+    from fastapi import HTTPException
+    from .auth import hash_password, create_access_token, create_refresh_token, decode_token
+
+    state = _state()
+    if not state.config.auth.enabled:
+        raise HTTPException(status_code=400, detail="Auth not enabled")
+
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+    email = body.get("email")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    if not state.db_session_factory:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    from .db import crud_users
+    async with state.db_session_factory() as session:
+        # Check if this is the first user (auto-admin)
+        user_count = await crud_users.count_users(session)
+        is_first_user = user_count == 0
+
+        # If not first user, require admin token
+        if not is_first_user:
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header:
+                raise HTTPException(status_code=401, detail="Admin token required")
+            try:
+                token = auth_header.removeprefix("Bearer ").strip()
+                payload = decode_token(token, state.config.auth.secret_key)
+                if payload.get("role") != "admin":
+                    raise HTTPException(status_code=403, detail="Admin access required")
+            except ValueError as e:
+                raise HTTPException(status_code=401, detail=str(e))
+
+        # Check for duplicate username
+        existing = await crud_users.get_user_by_username(session, username)
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already taken")
+
+        # Create user
+        role = body.get("role", "admin" if is_first_user else "user")
+        pw_hash = hash_password(password)
+        user = await crud_users.create_user(
+            session, username=username, email=email,
+            password_hash=pw_hash, role=role)
+
+    # Return tokens
+    token_data = {"sub": user["id"], "username": user["username"], "role": user["role"]}
+    access_token = create_access_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.access_token_expire_minutes)
+    refresh_token = create_refresh_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.refresh_token_expire_days)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {"id": user["id"], "username": user["username"], "role": user["role"]},
+    }
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(request: Request):
+    """Refresh an access token using a valid refresh token."""
+    from fastapi import HTTPException
+    from .auth import decode_token, create_access_token, create_refresh_token
+
+    state = _state()
+    if not state.config.auth.enabled:
+        raise HTTPException(status_code=400, detail="Auth not enabled")
+
+    body = await request.json()
+    refresh_token = body.get("refresh_token", "")
+
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="Refresh token required")
+
+    try:
+        payload = decode_token(refresh_token, state.config.auth.secret_key)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+
+    # Issue new tokens
+    token_data = {"sub": payload["sub"], "username": payload["username"], "role": payload["role"]}
+    new_access = create_access_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.access_token_expire_minutes)
+    new_refresh = create_refresh_token(
+        token_data, state.config.auth.secret_key,
+        state.config.auth.refresh_token_expire_days)
+
+    return {
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "token_type": "bearer",
+        "expires_in": state.config.auth.access_token_expire_minutes * 60,
+    }
+
+
+@app.get("/auth/me")
+async def auth_me(authorization: str = Header(default="")):
+    """Get current user info from JWT."""
+    from fastapi import HTTPException
+    from .auth import decode_token
+
+    state = _state()
+    if not state.config.auth.enabled:
+        raise HTTPException(status_code=400, detail="Auth not enabled")
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization required")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = decode_token(token, state.config.auth.secret_key)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    return {
+        "id": payload.get("sub"),
+        "username": payload.get("username"),
+        "role": payload.get("role"),
+    }
+
+
+# ── v5 Dashboard API endpoints ──────────────────────────────────────────
+
+@app.get("/api/stats")
+async def api_stats(authorization: str = Header(default="")):
+    """Aggregated analytics: total requests, costs, tokens, per-model breakdown."""
+    from fastapi import HTTPException
+
+    state = _state()
+    if not state.config.is_v5_mode or not state.db_session_factory:
+        raise HTTPException(status_code=400, detail="v5 mode with database required")
+
+    from .db import crud_logs, crud_analytics
+
+    async with state.db_session_factory() as session:
+        total_requests = await crud_logs.count_logs(session)
+        cost_by_model = await crud_analytics.aggregate_costs(session)
+
+    uptime = int(time.time() - state.start_time)
+    return JSONResponse({
+        "proxy": "codex-proxy",
+        "version": __version__,
+        "uptime_seconds": uptime,
+        "requests_total": state.request_count,
+        "success_count": state.success_count,
+        "failure_count": state.failure_count,
+        "db_requests_logged": total_requests,
+        "cost_by_model": cost_by_model,
+        "providers_count": len(state.providers_map),
+    })
+
+
+@app.get("/api/usage")
+async def api_usage(request: Request, authorization: str = Header(default="")):
+    """Cost and token usage over time, with optional ?model= filter."""
+    from fastapi import HTTPException
+
+    state = _state()
+    if not state.config.is_v5_mode or not state.db_session_factory:
+        raise HTTPException(status_code=400, detail="v5 mode with database required")
+
+    from .db import crud_logs, crud_analytics
+
+    model_filter = request.query_params.get("model")
+    hours = int(request.query_params.get("hours", "24"))
+
+    async with state.db_session_factory() as session:
+        if model_filter:
+            cost_data = await crud_analytics.aggregate_costs(session)
+            cost_data = [c for c in cost_data if c.get("group_key") == model_filter]
+        else:
+            cost_data = await crud_analytics.aggregate_costs(session)
+
+        total = await crud_logs.count_logs(session)
+
+    return JSONResponse({
+        "period_hours": hours,
+        "model_filter": model_filter,
+        "total_logged_requests": total,
+        "cost_breakdown": cost_data,
+    })
+
+
+@app.get("/api/providers")
+async def api_providers(authorization: str = Header(default="")):
+    """Provider status with routing info."""
+    state = _state()
+    providers_info = []
+    for name, ps in state.providers_map.items():
+        info = {
+            "name": name,
+            "display_name": ps.config.display_name,
+            "base_url": ps.base_url,
+            "models": ps.config.models,
+            "default_model": ps.config.default_model,
+            "has_key_rotation": ps.key_rotator is not None,
+        }
+        providers_info.append(info)
+
+    result: dict[str, Any] = {
+        "providers": providers_info,
+        "total": len(providers_info),
+    }
+    if state.smart_router:
+        result["router"] = state.smart_router.get_status()
+    return JSONResponse(result)
+
+
+@app.get("/api/router/status")
+async def api_router_status(authorization: str = Header(default="")):
+    """Detailed smart router status and per-provider latency."""
+    from fastapi import HTTPException
+
+    state = _state()
+    if not state.smart_router:
+        raise HTTPException(status_code=400, detail="Router not enabled")
+
+    return JSONResponse(state.smart_router.get_status())
 
 
 def run(config: ProxyConfig, *, tui: bool = False) -> None:
