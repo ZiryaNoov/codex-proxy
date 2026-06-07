@@ -1,4 +1,9 @@
-"""Config file loading — ~/.codex-proxy/config.toml"""
+"""Config file loading — ~/.codex-proxy/config.toml
+
+Supports v4 single-provider ([provider]) and v5 multi-provider ([[providers]])
+config formats. New v5 sections ([database], [auth], [router], [dashboard])
+default to disabled for zero-breaking-change migration.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ DEFAULT_DIR = Path.home() / ".codex-proxy"
 DEFAULT_CONFIG = DEFAULT_DIR / "config.toml"
 DEFAULT_PORT = 4242
 
+
+# ── v4 config dataclasses (unchanged) ─────────────────────────────────────
 
 @dataclass
 class ProviderConfig:
@@ -102,20 +109,102 @@ class RateLimitConfig:
     window_seconds: int = 60
 
 
+# ── v5 config dataclasses (new) ───────────────────────────────────────────
+
+@dataclass
+class DatabaseConfig:
+    """Database connection settings. Disabled by default for v4 compat."""
+    enabled: bool = False
+    url: str = ""  # empty = default SQLite path
+    echo: bool = False
+
+
+@dataclass
+class AuthConfig:
+    """Authentication and multi-user settings. Disabled by default."""
+    enabled: bool = False
+    secret_key: str = ""  # auto-generated if empty
+    access_token_expire_minutes: int = 15
+    refresh_token_expire_days: int = 7
+    admin_username: str = "admin"
+    admin_password: str = ""  # set on first startup if empty
+
+
+@dataclass
+class RouterConfig:
+    """Smart routing settings. Disabled by default."""
+    enabled: bool = False
+    default_strategy: str = "fallback"  # cost|latency|fallback|weighted
+
+
+@dataclass
+class DashboardConfig:
+    """Web dashboard settings."""
+    enabled: bool = False
+    open_browser: bool = False
+
+
 @dataclass
 class ProxyConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
+    providers: list[ProviderConfig] = field(default_factory=list)
     store: StoreConfig = field(default_factory=StoreConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     plugins: PluginConfig = field(default_factory=PluginConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    # v5 sections — all default to disabled
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    router: RouterConfig = field(default_factory=RouterConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+
+    def all_providers(self) -> list[ProviderConfig]:
+        """Return all providers. If [[providers]] is set, use it; otherwise
+        fall back to the v4 single [provider] section."""
+        if self.providers:
+            return self.providers
+        return [self.provider]
+
+    @property
+    def is_v5_mode(self) -> bool:
+        """True if any v5 feature is enabled (database, auth, router, dashboard)."""
+        return (
+            self.database.enabled
+            or self.auth.enabled
+            or self.router.enabled
+            or self.dashboard.enabled
+        )
+
+    @property
+    def effective_db_url(self) -> str:
+        """Return the effective database URL, with default SQLite path if not set."""
+        if self.database.url:
+            return self.database.url
+        return f"sqlite+aiosqlite:///{DEFAULT_DIR / 'proxy.db'}"
+
+
+def _parse_provider(raw: dict) -> ProviderConfig:
+    """Parse a single provider dict from TOML into a ProviderConfig."""
+    return ProviderConfig(
+        name=raw.get("name", "zai"),
+        display_name=raw.get("display_name", "Z.AI"),
+        base_url=raw.get("base_url", "https://api.z.ai/api/paas/v4"),
+        api_key=raw.get("api_key", ""),
+        api_key_env=raw.get("api_key_env", ""),
+        api_keys=raw.get("api_keys", []),
+        api_keys_env=raw.get("api_keys_env", []),
+        models=raw.get("models", ["glm-5.1", "glm-5", "glm-4.7"]),
+        default_model=raw.get("default_model", "glm-5.1"),
+        stream=raw.get("stream", True),
+        extra_headers=raw.get("extra_headers", {}),
+    )
 
 
 def load_config(path: Path | None = None) -> ProxyConfig:
     """Load config from TOML file, falling back to defaults."""
-    config_path = path or DEFAULT_CONFIG
+    config_path = Path(path) if path else DEFAULT_CONFIG
 
     if not config_path.exists():
         # Try env var overrides for quick setup
@@ -132,6 +221,7 @@ def load_config(path: Path | None = None) -> ProxyConfig:
     with open(config_path, "rb") as f:
         raw = tomllib.load(f)
 
+    # ── Parse v4 sections (unchanged) ──────────────────────────────────
     server_raw = raw.get("server", {})
     provider_raw = raw.get("provider", {})
     store_raw = raw.get("store", {})
@@ -153,19 +243,7 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         cors_origins=server_raw.get("cors_origins", []),
     )
 
-    provider = ProviderConfig(
-        name=provider_raw.get("name", "zai"),
-        display_name=provider_raw.get("display_name", "Z.AI"),
-        base_url=provider_raw.get("base_url", "https://api.z.ai/api/paas/v4"),
-        api_key=provider_raw.get("api_key", ""),
-        api_key_env=provider_raw.get("api_key_env", ""),
-        api_keys=provider_raw.get("api_keys", []),
-        api_keys_env=provider_raw.get("api_keys_env", []),
-        models=provider_raw.get("models", ["glm-5.1", "glm-5", "glm-4.7"]),
-        default_model=provider_raw.get("default_model", "glm-5.1"),
-        stream=provider_raw.get("stream", True),
-        extra_headers=provider_raw.get("extra_headers", {}),
-    )
+    provider = _parse_provider(provider_raw)
 
     store = StoreConfig(
         ttl_seconds=store_raw.get("ttl_seconds", 600),
@@ -196,10 +274,45 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         window_seconds=rl_raw.get("window_seconds", 60),
     )
 
+    # ── Parse v5 sections (new, all optional) ──────────────────────────
+
+    # Multi-provider: [[providers]] array-of-tables
+    providers_list = [_parse_provider(p) for p in raw.get("providers", [])]
+
+    db_raw = raw.get("database", {})
+    database = DatabaseConfig(
+        enabled=db_raw.get("enabled", False),
+        url=db_raw.get("url", ""),
+        echo=db_raw.get("echo", False),
+    )
+
+    auth_raw = raw.get("auth", {})
+    auth = AuthConfig(
+        enabled=auth_raw.get("enabled", False),
+        secret_key=auth_raw.get("secret_key", ""),
+        access_token_expire_minutes=auth_raw.get("access_token_expire_minutes", 15),
+        refresh_token_expire_days=auth_raw.get("refresh_token_expire_days", 7),
+        admin_username=auth_raw.get("admin_username", "admin"),
+        admin_password=auth_raw.get("admin_password", ""),
+    )
+
+    router_raw = raw.get("router", {})
+    router = RouterConfig(
+        enabled=router_raw.get("enabled", False),
+        default_strategy=router_raw.get("default_strategy", "fallback"),
+    )
+
+    dash_raw = raw.get("dashboard", {})
+    dashboard = DashboardConfig(
+        enabled=dash_raw.get("enabled", False),
+        open_browser=dash_raw.get("open_browser", False),
+    )
+
     return ProxyConfig(
-        server=server, provider=provider, store=store,
-        circuit_breaker=circuit_breaker, compaction=compaction,
+        server=server, provider=provider, providers=providers_list,
+        store=store, circuit_breaker=circuit_breaker, compaction=compaction,
         plugins=plugins, rate_limit=rate_limit,
+        database=database, auth=auth, router=router, dashboard=dashboard,
     )
 
 
@@ -247,6 +360,50 @@ enabled = true             # enable hook-based middleware plugins
 plugins = [
     "codex_proxy.plugins_builtin.LoggingPlugin",  # built-in structured logger
 ]
+
+# ── v5 Features (all disabled by default for v4 compat) ──────────────────
+
+# [database]
+# enabled = true            # enable persistent storage
+# url = ""                  # empty = SQLite at ~/.codex-proxy/proxy.db
+# # url = "postgresql+asyncpg://user:pass@localhost/codexproxy"
+# echo = false              # SQL debug logging
+
+# [auth]
+# enabled = true            # enable multi-user authentication
+# secret_key = ""           # auto-generated if empty; set for production
+# access_token_expire_minutes = 15
+# refresh_token_expire_days = 7
+# admin_username = "admin"
+# admin_password = "changeme"  # hashed on first startup
+
+# [router]
+# enabled = true            # enable smart routing between providers
+# default_strategy = "fallback"  # cost|latency|fallback|weighted
+
+# [dashboard]
+# enabled = true            # serve web dashboard at /
+# open_browser = false      # auto-open browser on startup
+
+# ── v5 Multi-Provider (optional, replaces single [provider]) ──────────────
+
+# [[providers]]
+# name = "zai"
+# display_name = "Z.AI"
+# base_url = "https://api.z.ai/api/paas/v4"
+# api_key_env = "OPENAI_API_KEY"
+# models = ["glm-5.1", "glm-5", "glm-4.7"]
+# default_model = "glm-5.1"
+
+# [[providers]]
+# name = "groq"
+# display_name = "Groq"
+# base_url = "https://api.groq.com/openai/v1"
+# api_key_env = "GROQ_API_KEY"
+# models = ["llama-4-maverick-17b"]
+# default_model = "llama-4-maverick-17b"
+
+# ── Single Provider (v4 format, still supported) ─────────────────────────
 
 [provider]
 # Provider: Z.AI (GLM models)

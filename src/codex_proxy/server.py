@@ -1,4 +1,8 @@
-"""FastAPI server — WebSocket + HTTP endpoints for Codex CLI."""
+"""FastAPI server — WebSocket + HTTP endpoints for Codex CLI.
+
+v5.0.0: Added database integration, multi-provider support, and request logging.
+Maintains full v4 backward compatibility when no v5 config sections are enabled.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -39,12 +43,24 @@ from .translator import (
 logger = logging.getLogger("codex-proxy")
 
 
+# ── Multi-provider state ─────────────────────────────────────────────────
+
+@dataclass
+class ProviderState:
+    """Runtime state for a single provider."""
+    config: Any  # ProviderConfig
+    adapter: ProviderAdapter
+    base_url: str
+    client: httpx.AsyncClient
+    key_rotator: KeyRotator | None = None
+
+
 @dataclass
 class AppState:
     config: ProxyConfig
     store: ResponseStore
-    client: httpx.AsyncClient
-    adapter: ProviderAdapter
+    client: httpx.AsyncClient  # primary client (v4 compat)
+    adapter: ProviderAdapter   # primary adapter (v4 compat)
     circuit_breaker: CircuitBreaker | None
     start_time: float = 0.0
     request_count: int = 0
@@ -54,6 +70,10 @@ class AppState:
     key_rotator: KeyRotator | None = None
     plugin_registry: PluginRegistry | None = None
     rate_limiter: RateLimiter | None = None
+    # v5 additions — None when v5 features are disabled
+    db_engine: Any | None = None       # sqlalchemy AsyncEngine
+    db_session_factory: Any | None = None  # async_sessionmaker
+    providers_map: dict[str, ProviderState] = field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -66,6 +86,13 @@ async def lifespan(app):
         await state.plugin_registry.on_shutdown()
     if state.client:
         await state.client.aclose()
+    # Close provider clients
+    for ps in state.providers_map.values():
+        await ps.client.aclose()
+    # Close database
+    if state.db_engine:
+        from .db import close_db
+        await close_db(state.db_engine)
     logger.info("codex-proxy shut down")
 
 
@@ -73,6 +100,11 @@ app = FastAPI(title="codex-proxy", lifespan=lifespan)
 
 
 def configure(config: ProxyConfig) -> None:
+    """Configure the proxy. Sync — sets up state on app.
+
+    In v5 mode (database enabled), call configure_async() instead
+    for full async initialization including DB setup.
+    """
     store = ResponseStore(
         ttl_seconds=config.store.ttl_seconds,
         max_entries=config.store.max_entries,
@@ -103,12 +135,17 @@ def configure(config: ProxyConfig) -> None:
         max_requests=rl_config.max_requests,
         window_seconds=rl_config.window_seconds,
     ) if rl_config.enabled else None
+
+    # Build multi-provider map
+    providers_map = _build_providers_map(config, client)
+
     app.state.proxy = AppState(
         config=config, store=store, client=client,
         adapter=adapter, circuit_breaker=cb, start_time=time.time(),
         key_rotator=key_rotator,
         plugin_registry=_build_plugin_registry(config),
         rate_limiter=rate_limiter,
+        providers_map=providers_map,
     )
     # CORS middleware (add only if origins configured)
     if config.server.cors_origins:
@@ -118,6 +155,124 @@ def configure(config: ProxyConfig) -> None:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+
+async def configure_async(config: ProxyConfig) -> None:
+    """Async configure — includes database initialization for v5 mode."""
+    # Run sync config first
+    configure(config)
+
+    if not config.is_v5_mode:
+        return
+
+    # Initialize database if enabled
+    if config.database.enabled:
+        from .db import init_db
+        engine, session_factory = await init_db(config.effective_db_url)
+        state = _state()
+        state.db_engine = engine
+        state.db_session_factory = session_factory
+        logger.info("v5 database enabled: %s", config.effective_db_url.split(":///")[-1])
+
+        # Seed providers from config into DB
+        await _seed_providers_from_config(state)
+
+    logger.info("v5 mode active — features: database=%s auth=%s router=%s dashboard=%s",
+                config.database.enabled, config.auth.enabled,
+                config.router.enabled, config.dashboard.enabled)
+
+
+async def _seed_providers_from_config(state: AppState) -> None:
+    """Seed provider tables from config on first startup."""
+    if not state.db_session_factory:
+        return
+
+    from .db import crud_providers
+    from cryptography.fernet import Fernet
+
+    async with state.db_session_factory() as session:
+        existing = await crud_providers.list_providers(session)
+        if existing:
+            return  # Already seeded
+
+        # Seed from config
+        for pcfg in state.config.all_providers():
+            provider = await crud_providers.create_provider(
+                session,
+                name=pcfg.name,
+                display_name=pcfg.display_name,
+                base_url=pcfg.base_url,
+                adapter_name=pcfg.name,
+                extra_headers=pcfg.extra_headers,
+            )
+
+            # Store API keys (encrypted with a simple key for now)
+            keys = pcfg.effective_api_keys()
+            if keys:
+                # Generate a Fernet key for encryption (stored per-instance)
+                fernet_key = Fernet.generate_key()
+                fernet = Fernet(fernet_key)
+                for key in keys:
+                    encrypted = fernet.encrypt(key.encode()).decode()
+                    prefix = key[:8] if len(key) >= 8 else key
+                    await crud_providers.add_provider_key(
+                        session,
+                        provider_id=provider["id"],
+                        encrypted_key=encrypted,
+                        key_prefix=prefix,
+                    )
+            logger.info("Seeded provider: %s (%d keys)", pcfg.name, len(keys))
+
+
+def _build_providers_map(config: ProxyConfig, primary_client: httpx.AsyncClient) -> dict[str, ProviderState]:
+    """Build the multi-provider map from config."""
+    providers_map: dict[str, ProviderState] = {}
+
+    for pcfg in config.all_providers():
+        client = primary_client  # Share the primary client for now
+        adapter = get_adapter(pcfg.name)
+        keys = pcfg.effective_api_keys()
+        key_rotator = None
+        if len(keys) > 1:
+            cb_config = config.circuit_breaker
+            key_rotator = KeyRotator(
+                keys=keys,
+                failure_threshold=cb_config.failure_threshold,
+                recovery_timeout=cb_config.recovery_timeout,
+            )
+
+        providers_map[pcfg.name] = ProviderState(
+            config=pcfg,
+            adapter=adapter,
+            base_url=pcfg.base_url,
+            client=client,
+            key_rotator=key_rotator,
+        )
+
+    return providers_map
+
+
+def _resolve_provider(state: AppState, model: str) -> tuple[ProviderState, str]:
+    """Resolve which provider to use for a given model.
+
+    Returns (ProviderState, resolved_model).
+    Falls back to primary provider if no match found.
+    """
+    # Try to find a provider that has this model
+    for name, ps in state.providers_map.items():
+        if model in ps.config.models:
+            return ps, model
+
+    # If only one provider, use it regardless
+    if len(state.providers_map) == 1:
+        ps = next(iter(state.providers_map.values()))
+        return ps, model
+
+    # Fallback to primary provider
+    return state.providers_map.get(
+        state.config.provider.name,
+        next(iter(state.providers_map.values())),
+    ), model
 
 
 def _state() -> AppState:
@@ -173,26 +328,29 @@ def _api_key(auth_header: str) -> str:
     return state.config.provider.effective_api_key()
 
 
-def _cc_headers(api_key: str) -> dict:
+def _cc_headers(api_key: str, adapter: ProviderAdapter | None = None) -> dict:
     state = _state()
+    a = adapter or state.adapter
     h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    # Merge extra_headers from resolved provider config
     h.update(state.config.provider.extra_headers)
-    return state.adapter.adjust_headers(h)
+    return a.adjust_headers(h)
 
 
 def _backend_url() -> str:
     return _state().config.provider.base_url
 
 
-async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Response:
+async def _post_with_retry(url: str, json_body: dict, headers: dict,
+                           client: httpx.AsyncClient | None = None) -> httpx.Response:
     """POST with retry on 5xx or transport errors."""
     state = _state()
     max_retries = state.config.server.max_retries
     retry_delay = state.config.server.retry_delay
-    client = state.client
+    c = client or state.client
     for attempt in range(max_retries + 1):
         try:
-            r = await client.post(url, json=json_body, headers=headers)
+            r = await c.post(url, json=json_body, headers=headers)
             if r.status_code < 500 or attempt == max_retries:
                 return r
             logger.warning("Upstream 5xx (attempt %d), retrying...", attempt + 1)
@@ -205,26 +363,62 @@ async def _post_with_retry(url: str, json_body: dict, headers: dict) -> httpx.Re
 
 
 async def _request_with_key_failover(url: str, json_body: dict,
-                                     headers: dict, api_key: str) -> httpx.Response:
+                                     headers: dict, api_key: str,
+                                     key_rotator: KeyRotator | None = None,
+                                     client: httpx.AsyncClient | None = None) -> httpx.Response:
     """POST with retry. On auth/rate-limit errors, rotate key and retry."""
     state = _state()
-    if not state.key_rotator:
-        return await _post_with_retry(url, json_body, headers)
-    max_attempts = state.key_rotator.key_count
+    kr = key_rotator or state.key_rotator
+    if not kr:
+        return await _post_with_retry(url, json_body, headers, client)
+    max_attempts = kr.key_count
     r: httpx.Response | None = None
     for _ in range(max_attempts):
-        r = await _post_with_retry(url, json_body, headers)
+        r = await _post_with_retry(url, json_body, headers, client)
         if r.status_code in (401, 403, 429):
-            state.key_rotator.record_failure(api_key, r.status_code)
-            api_key = state.key_rotator.next_key()
+            kr.record_failure(api_key, r.status_code)
+            api_key = kr.next_key()
             headers = _cc_headers(api_key)
             logger.warning("Key failed with %d, rotating", r.status_code)
             continue
         if r.status_code < 400:
-            state.key_rotator.record_success(api_key)
+            kr.record_success(api_key)
         return r
     assert r is not None
     return r
+
+
+async def _log_request(state: AppState, request_id: str, model: str,
+                       method: str, provider_name: str,
+                       input_tokens: int, output_tokens: int,
+                       cost_usd: float, latency_ms: float,
+                       status_code: int | None, error: str | None,
+                       is_stream: bool, user_id: str | None = None) -> None:
+    """Log a request to the database (non-blocking, best-effort)."""
+    if not state.db_session_factory:
+        return
+    try:
+        from .db import crud_logs
+        async with state.db_session_factory() as session:
+            await crud_logs.insert_log(
+                session,
+                user_id=user_id,
+                provider_id=None,  # TODO: resolve from provider_name
+                request_id=request_id,
+                model=model,
+                method=method,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                error_message=error,
+                is_stream=is_stream,
+            )
+            await session.commit()
+    except Exception as e:
+        logger.warning("Failed to log request: %s", e)
 
 
 # ── HTTP endpoint ───────────────────────────────────────────────────────
@@ -265,6 +459,13 @@ async def responses_http(request: Request,
     body = state.store.resolve_input(body)
     model = body.get("model", state.config.provider.default_model)
     stream = body.get("stream", False)
+
+    # Resolve provider (multi-provider support)
+    ps, resolved_model = _resolve_provider(state, model)
+    adapter = ps.adapter
+    base_url = ps.base_url
+    key_rotator = ps.key_rotator or state.key_rotator
+
     api_key = _api_key(authorization)
 
     cc_body = build_cc_request(
@@ -273,10 +474,10 @@ async def responses_http(request: Request,
         compaction_max_messages=state.config.compaction.max_messages,
         compaction_keep_last=state.config.compaction.keep_last,
     )
-    cc_body["model"] = model
+    cc_body["model"] = resolved_model
     cc_body["stream"] = stream
-    cc_body = state.adapter.adjust_request(cc_body)
-    headers = _cc_headers(api_key)
+    cc_body = adapter.adjust_request(cc_body)
+    headers = _cc_headers(api_key, adapter)
 
     # Plugin: on_request
     req_id = uuid.uuid4().hex[:12]
@@ -284,19 +485,25 @@ async def responses_http(request: Request,
         ctx = _build_plugin_ctx(req_id, "http", model, api_key, stream)
         await state.plugin_registry.on_request(ctx)
 
+    start_t = time.monotonic()
+
     if stream:
         result_holder: dict = {}
         original_input = body.get("input", [])
 
         async def _stream():
-            async with state.client.stream("POST", f"{_backend_url()}/chat/completions",
-                                           json=cc_body, headers=headers) as resp:
+            async with ps.client.stream("POST", f"{base_url}/chat/completions",
+                                        json=cc_body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     error_body = await resp.aread()
                     logger.error("Upstream error %d: %s", resp.status_code, error_body[:500])
                     if state.circuit_breaker:
                         state.circuit_breaker.record_failure()
                     state.failure_count += 1
+                    duration = (time.monotonic() - start_t) * 1000
+                    await _log_request(state, req_id, model, "http", ps.config.name,
+                                       0, 0, 0, duration, resp.status_code,
+                                       error_body[:200].decode(errors="replace"), True)
                     yield f"event: error\ndata: {json.dumps({'error': {'message': 'upstream error', 'status': resp.status_code}})}\n\n"
                     return
 
@@ -312,13 +519,21 @@ async def responses_http(request: Request,
             if completed:
                 state.store.put(completed["id"], {**completed, "_original_input": original_input})
 
+            # Log to DB
+            duration = (time.monotonic() - start_t) * 1000
+            resp_data = result_holder.get("response", {})
+            usage = resp_data.get("usage", {})
+            await _log_request(state, req_id, model, "http", ps.config.name,
+                               usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                               0.0, duration, 200, None, True)
+
         return StreamingResponse(_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
 
-    start_t = time.monotonic()
     r = await _request_with_key_failover(
-        f"{_backend_url()}/chat/completions", cc_body, headers, api_key)
+        f"{base_url}/chat/completions", cc_body, headers, api_key,
+        key_rotator=key_rotator, client=ps.client)
     duration = (time.monotonic() - start_t) * 1000
 
     if r.status_code >= 400:
@@ -332,6 +547,8 @@ async def responses_http(request: Request,
             ectx.error = r.text[:200]
             ectx.duration_ms = duration
             await state.plugin_registry.on_error(ectx)
+        await _log_request(state, req_id, model, "http", ps.config.name,
+                           0, 0, 0, duration, r.status_code, r.text[:200], False)
         return JSONResponse({"error": {"message": "upstream error",
                                        "status": r.status_code}},
                             status_code=502)
@@ -346,6 +563,13 @@ async def responses_http(request: Request,
         await state.plugin_registry.on_response(rctx)
     resp = cc_to_response(r.json(), model)
     state.store.put(resp["id"], {**resp, "_original_input": body.get("input", [])})
+
+    # Log to DB with usage data
+    usage = resp.get("usage", {})
+    await _log_request(state, req_id, model, "http", ps.config.name,
+                       usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                       0.0, duration, 200, None, False)
+
     return JSONResponse(resp)
 
 
@@ -381,16 +605,20 @@ async def responses_ws(ws: WebSocket):
                 api_key = state.key_rotator.next_key()
             body = state.store.resolve_input(body)
             model = body.get("model", state.config.provider.default_model)
+
+            # Resolve provider
+            ps, resolved_model = _resolve_provider(state, model)
+
             cc_body = build_cc_request(
                 body,
                 compaction_enabled=state.config.compaction.enabled,
                 compaction_max_messages=state.config.compaction.max_messages,
                 compaction_keep_last=state.config.compaction.keep_last,
             )
-            cc_body["model"] = model
+            cc_body["model"] = resolved_model
             cc_body["stream"] = True
-            cc_body = state.adapter.adjust_request(cc_body)
-            headers = _cc_headers(api_key)
+            cc_body = ps.adapter.adjust_request(cc_body)
+            headers = _cc_headers(api_key, ps.adapter)
 
             if state.circuit_breaker and not state.circuit_breaker.can_execute():
                 error_resp = {
@@ -409,6 +637,7 @@ async def responses_ws(ws: WebSocket):
             rid = generate_response_id()
             mid = f"msg_{uuid.uuid4().hex[:24]}"
             now = int(time.time())
+            start_t = time.monotonic()
 
             init = {"id": rid, "object": "response", "created_at": now,
                     "model": model, "status": "in_progress", "output": [],
@@ -436,8 +665,8 @@ async def responses_ws(ws: WebSocket):
             usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
             try:
-                async with state.client.stream(
-                    "POST", f"{_backend_url()}/chat/completions",
+                async with ps.client.stream(
+                    "POST", f"{ps.base_url}/chat/completions",
                     json=cc_body, headers=headers
                 ) as resp:
                     async for event_type, data in parse_cc_stream(resp.aiter_lines()):
@@ -462,6 +691,9 @@ async def responses_ws(ws: WebSocket):
                 if state.circuit_breaker:
                     state.circuit_breaker.record_failure()
                 state.failure_count += 1
+                duration = (time.monotonic() - start_t) * 1000
+                await _log_request(state, rid[:12], model, "ws", ps.config.name,
+                                   0, 0, 0, duration, None, str(e)[:200], True)
                 error_resp = {
                     "id": rid, "object": "response", "created_at": now,
                     "model": model, "status": "failed",
@@ -520,6 +752,13 @@ async def responses_ws(ws: WebSocket):
             state.store.put(rid, {**completed,
                                   "_original_input": body.get("input", [])})
 
+            # Log to DB
+            duration = (time.monotonic() - start_t) * 1000
+            await _log_request(state, rid[:12], model, "ws", ps.config.name,
+                               usage_data.get("input_tokens", 0),
+                               usage_data.get("output_tokens", 0),
+                               0.0, duration, 200, None, True)
+
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
@@ -544,13 +783,16 @@ async def get_response(response_id: str):
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
-    provider = _state().config.provider
-    return JSONResponse({
-        "object": "list",
-        "data": [{"id": m, "object": "model",
-                  "owned_by": provider.name}
-                 for m in provider.models],
-    })
+    state = _state()
+    # Collect models from all providers
+    all_models = []
+    seen = set()
+    for pcfg in state.config.all_providers():
+        for m in pcfg.models:
+            if m not in seen:
+                all_models.append({"id": m, "object": "model", "owned_by": pcfg.name})
+                seen.add(m)
+    return JSONResponse({"object": "list", "data": all_models})
 
 
 @app.get("/health")
@@ -561,6 +803,14 @@ async def health(request: Request):
         "proxy": "codex-proxy",
         "version": __version__,
     }
+    if state.config.is_v5_mode:
+        result["mode"] = "v5"
+        result["features"] = {
+            "database": state.config.database.enabled,
+            "auth": state.config.auth.enabled,
+            "router": state.config.router.enabled,
+            "dashboard": state.config.dashboard.enabled,
+        }
     if request.query_params.get("check_backend"):
         try:
             r = await state.client.get(
@@ -581,7 +831,6 @@ async def health(request: Request):
 async def status(authorization: str = Header(default="")):
     _require_admin(authorization)
     state = _state()
-    provider = state.config.provider
     uptime = int(time.time() - state.start_time)
     result = {
         "proxy": "codex-proxy",
@@ -591,17 +840,21 @@ async def status(authorization: str = Header(default="")):
         "requests_total": state.request_count,
         "response_store_size": state.store.size(),
         "provider": {
-            "name": provider.name,
-            "display_name": provider.display_name,
-            "base_url": provider.base_url,
-            "models": provider.models,
-            "default_model": provider.default_model,
+            "name": state.config.provider.name,
+            "display_name": state.config.provider.display_name,
+            "base_url": state.config.provider.base_url,
+            "models": state.config.provider.models,
+            "default_model": state.config.provider.default_model,
         },
         "server": {
             "host": state.config.server.host,
             "port": state.config.server.port,
         },
     }
+    if state.config.is_v5_mode:
+        result["mode"] = "v5"
+        result["providers_count"] = len(state.providers_map)
+        result["database"] = state.config.database.enabled
     if state.circuit_breaker:
         result["circuit_breaker"] = state.circuit_breaker.get_status()
     if state.key_rotator:
@@ -654,6 +907,8 @@ def reload_config_internal(state: AppState) -> tuple[str, str]:
         window_seconds=rl_config.window_seconds,
     ) if rl_config.enabled else None
     state.plugin_registry = _build_plugin_registry(new_config)
+    # Rebuild providers map
+    state.providers_map = _build_providers_map(new_config, state.client)
     return new_config.provider.display_name, new_config.provider.default_model
 
 
@@ -700,8 +955,12 @@ def run(config: ProxyConfig, *, tui: bool = False) -> None:
     else:
         print(f"  codex-proxy v{__version__}")
         print(f"  http://{config.server.host}:{config.server.port}")
-        print(f"  backend  {config.provider.display_name} ({config.provider.base_url})")
-        print(f"  models   {', '.join(config.provider.models)}")
+        providers = config.all_providers()
+        for p in providers:
+            print(f"  provider  {p.display_name} ({p.base_url})")
+            print(f"  models    {', '.join(p.models)}")
+        if config.is_v5_mode:
+            print(f"  mode      v5 (database={config.database.enabled}, auth={config.auth.enabled})")
 
     uvicorn.run(app, host=config.server.host, port=config.server.port,
                 log_level=config.server.log_level)
