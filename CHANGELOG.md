@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0] - 2026-06-07
+
+### Added — v5 Gateway Platform
+
+**Database Layer**
+- Async SQLAlchemy database with 13 tables (users, api_keys, providers, provider_keys, models, routing_rules, request_logs, budgets, cost_alerts, plugin_registry, plugin_instances, sessions, _schema_version)
+- SQLite (default) or PostgreSQL (via asyncpg) backend
+- Version-based migrations system
+- 7 CRUD modules for all entities
+
+**Multi-Provider Support**
+- `[[providers]]` TOML array — configure multiple providers in one instance
+- Per-provider clients, adapters, key rotators
+- Model-to-provider resolution across all providers
+- `/models` endpoint aggregates models from all providers
+
+**JWT Authentication**
+- POST `/auth/login`, `/auth/signup`, `/auth/refresh`, GET `/auth/me`
+- Password hashing with bcrypt (SHA-256 fallback)
+- JWT access + refresh tokens (PyJWT with stdlib HMAC-SHA256 fallback)
+- Admin user auto-seeded on first startup
+- Budget endpoints: GET/PUT `/auth/budget`
+
+**Smart Router**
+- 4 routing strategies: `fallback` (config order), `cost` (cheapest), `latency` (fastest), `weighted` (load balanced)
+- Rolling latency tracker with per-provider health detection
+- Unhealthy providers automatically skipped
+- GET `/api/router/status` for detailed metrics
+
+**Cost Tracking**
+- Per-model pricing: input_price_per_million, output_price_per_million
+- 25+ built-in model prices (GLM, GPT, Claude, Gemini, DeepSeek, Llama, etc.)
+- Automatic cost calculation on every request (DB lookup → KNOWN_PRICING fallback → $0)
+- Prices auto-seeded to DB on startup (idempotent)
+- Cost aggregation analytics: GET `/api/stats`, `/api/usage`
+
+**Budget Enforcement**
+- Daily and monthly spend limits per user
+- Requests blocked with 429 when budget exceeded
+- Alert threshold notifications
+- Budget status and alerts via API
+
+**Web Dashboard**
+- Embedded HTML+CSS+JS dashboard at GET `/dashboard`
+- Dark theme, auto-refresh every 10 seconds
+- Stats cards (requests, success rate, uptime, total cost)
+- Cost breakdown table with visual bars
+- Provider cards with model tags
+- Router status with latency and health info
+
+**v5 Config Sections** (all disabled by default for v4 compat)
+- `[database]` — persistent storage settings
+- `[auth]` — JWT authentication settings
+- `[router]` — smart routing settings
+- `[dashboard]` — web dashboard settings
+
+**New Dependencies**
+- `sqlalchemy>=2.0`, `aiosqlite>=0.20` (core)
+- Optional: `asyncpg>=0.29` (postgres), `bcrypt>=4.0`, `PyJWT>=2.8`, `cryptography>=42.0` (enterprise)
+
+**Testing**
+- 270+ tests (up from 217): 20 DB tests, 33 auth/cost/router tests
+- All existing v4 tests pass unchanged — zero regressions
+
+### Changed
+- Description updated: "LLM Gateway Platform — multi-provider proxy with smart routing, cost analytics, and web dashboard"
+- `_log_request()` now calculates real costs and resolves provider_id from DB
+- `/status` endpoint includes v5 features, auth, and router status
+- Startup output shows all providers and v5 mode
+
+### Backward Compatibility
+- All v5 features **disabled by default** — v4 config works as-is with zero changes
+- No breaking changes to existing API endpoints or behavior
+
 ## [4.0.0] - 2026-06-07
 
 ### Fixed

@@ -1,3 +1,3 @@
-"""codex-proxy — Responses API to Chat Completions bridge for Codex CLI."""
+"""codex-proxy — LLM Gateway Platform with smart routing, auth, and cost analytics."""
 
-__version__ = "5.0.0a1"
+__version__ = "5.0.0"
