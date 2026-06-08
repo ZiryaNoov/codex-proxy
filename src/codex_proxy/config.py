@@ -145,6 +145,15 @@ class DashboardConfig:
 
 
 @dataclass
+class DocumentsConfig:
+    """Document conversion and ingestion settings (MarkItDown)."""
+    enabled: bool = False
+    storage_path: str = ""  # empty = ~/.codex-proxy/documents
+    max_file_size_bytes: int = 50 * 1024 * 1024  # 50 MB
+    allowed_extensions: list[str] = field(default_factory=list)  # empty = all supported
+
+
+@dataclass
 class ProxyConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
@@ -159,6 +168,7 @@ class ProxyConfig:
     auth: AuthConfig = field(default_factory=AuthConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    documents: DocumentsConfig = field(default_factory=DocumentsConfig)
 
     def all_providers(self) -> list[ProviderConfig]:
         """Return all providers. If [[providers]] is set, use it; otherwise
@@ -175,6 +185,7 @@ class ProxyConfig:
             or self.auth.enabled
             or self.router.enabled
             or self.dashboard.enabled
+            or self.documents.enabled
         )
 
     @property
@@ -308,11 +319,20 @@ def load_config(path: Path | None = None) -> ProxyConfig:
         open_browser=dash_raw.get("open_browser", False),
     )
 
+    doc_raw = raw.get("documents", {})
+    documents = DocumentsConfig(
+        enabled=doc_raw.get("enabled", False),
+        storage_path=doc_raw.get("storage_path", ""),
+        max_file_size_bytes=doc_raw.get("max_file_size_bytes", 50 * 1024 * 1024),
+        allowed_extensions=doc_raw.get("allowed_extensions", []),
+    )
+
     return ProxyConfig(
         server=server, provider=provider, providers=providers_list,
         store=store, circuit_breaker=circuit_breaker, compaction=compaction,
         plugins=plugins, rate_limit=rate_limit,
         database=database, auth=auth, router=router, dashboard=dashboard,
+        documents=documents,
     )
 
 
@@ -384,6 +404,12 @@ plugins = [
 # [dashboard]
 # enabled = true            # serve web dashboard at /
 # open_browser = false      # auto-open browser on startup
+
+# [documents]
+# enabled = true            # enable document conversion & ingestion (MarkItDown)
+# storage_path = ""         # empty = ~/.codex-proxy/documents
+# max_file_size_bytes = 52428800  # 50 MB max upload
+# allowed_extensions = []   # empty = all supported formats
 
 # ── v5 Multi-Provider (optional, replaces single [provider]) ──────────────
 

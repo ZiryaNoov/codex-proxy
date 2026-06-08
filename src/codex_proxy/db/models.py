@@ -10,10 +10,10 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    Table,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy import Table
 
 # Shared metadata object — all tables register here
 metadata = MetaData()
@@ -207,4 +207,18 @@ sessions = Table(
 _schema_version = Table(
     "_schema_version", metadata,
     Column("version", Integer, primary_key=True),
+)
+
+# ── 14. Documents (ingested file conversions via MarkItDown) ──────────────
+
+documents = Table(
+    "documents", metadata,
+    Column("id", String(36), primary_key=True),              # UUID
+    Column("user_id", String(36), nullable=True, index=True),  # NULL when auth disabled
+    Column("filename", String(256), nullable=False),
+    Column("original_path", String(512), nullable=False),    # path on disk
+    Column("markdown_content", Text, nullable=False),
+    Column("file_type", String(32), nullable=False),         # extension: pdf, docx, etc.
+    Column("file_size", Integer, nullable=False),
+    Column("created_at", String(32), nullable=False),
 )
