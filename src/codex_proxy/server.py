@@ -17,7 +17,8 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import File as FastAPIFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -207,9 +208,19 @@ async def configure_async(config: ProxyConfig) -> None:
         )
         logger.info("v5 router enabled — strategy: %s", config.router.default_strategy)
 
-    logger.info("v5 mode active — features: database=%s auth=%s router=%s dashboard=%s",
+    # Initialize documents if enabled
+    if config.documents.enabled:
+        from pathlib import Path as _Path
+        storage = config.documents.storage_path or str(
+            _Path.home() / ".codex-proxy" / "documents"
+        )
+        _Path(storage).mkdir(parents=True, exist_ok=True)
+        logger.info("v5 documents enabled — storage: %s", storage)
+
+    logger.info("v5 mode active — features: database=%s auth=%s router=%s dashboard=%s documents=%s",
                 config.database.enabled, config.auth.enabled,
-                config.router.enabled, config.dashboard.enabled)
+                config.router.enabled, config.dashboard.enabled,
+                config.documents.enabled)
 
 
 async def _seed_providers_from_config(state: AppState) -> None:
@@ -955,6 +966,7 @@ async def health(request: Request):
             "auth": state.config.auth.enabled,
             "router": state.config.router.enabled,
             "dashboard": state.config.dashboard.enabled,
+            "documents": state.config.documents.enabled,
         }
     if request.query_params.get("check_backend"):
         try:
@@ -1440,6 +1452,240 @@ async def dashboard_page():
     from fastapi.responses import HTMLResponse
     from .dashboard import DASHBOARD_HTML
     return HTMLResponse(content=DASHBOARD_HTML)
+
+
+# ── v5 Document endpoints (MarkItDown) ───────────────────────────────────
+
+
+@app.post("/documents/convert")
+async def documents_convert(file: UploadFile = FastAPIFile(...)):
+    """Convert an uploaded file to Markdown (stateless, no auth required)."""
+    from .documents import validate_file, convert_and_cleanup, get_file_type
+
+    # Read file content for size check
+    content = await file.read()
+    file_size = len(content)
+
+    error = validate_file(
+        file.filename or "", file_size,
+        max_size=_state().config.documents.max_file_size_bytes,
+    )
+    if error:
+        return JSONResponse({"error": error}, status_code=400)
+
+    # Write to temp file for MarkItDown
+    import tempfile
+    from pathlib import Path as _Path
+
+    ext = _Path(file.filename or "unknown").suffix
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        markdown, title = await convert_and_cleanup(tmp_path)
+    except Exception as e:
+        # Clean up on failure
+        try:
+            _Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return JSONResponse({"error": f"Conversion failed: {e}"}, status_code=500)
+
+    return JSONResponse({
+        "filename": file.filename,
+        "file_type": get_file_type(file.filename or ""),
+        "file_size": file_size,
+        "title": title,
+        "markdown": markdown,
+    })
+
+
+@app.post("/documents/ingest")
+async def documents_ingest(
+    file: UploadFile = FastAPIFile(...),
+    authorization: str = Header(default=""),
+):
+    """Upload, convert, and store a document for later retrieval."""
+    from fastapi import HTTPException
+    from .documents import validate_file, convert_file, save_upload_file, get_file_type
+    from .db import crud_documents
+    from pathlib import Path as _Path
+
+    state = _state()
+
+    if not state.config.documents.enabled:
+        return JSONResponse({"error": "Documents feature is not enabled"}, status_code=400)
+    if not state.db_session_factory:
+        return JSONResponse({"error": "Database required for document ingestion"}, status_code=400)
+
+    # Auth check
+    user_id = None
+    if state.config.auth.enabled:
+        from .auth import decode_token
+        payload = decode_token(authorization.replace("Bearer ", ""), state.config)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = payload.get("sub")
+
+    # Read + validate
+    content = await file.read()
+    file_size = len(content)
+
+    error = validate_file(
+        file.filename or "", file_size,
+        max_size=state.config.documents.max_file_size_bytes,
+    )
+    if error:
+        return JSONResponse({"error": error}, status_code=400)
+
+    # Save original to storage dir
+    storage = state.config.documents.storage_path or str(
+        _Path.home() / ".codex-proxy" / "documents"
+    )
+    dest_dir = _Path(storage)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    import uuid as _uuid
+    ext = _Path(file.filename or "unknown").suffix
+    unique_name = f"{_uuid.uuid4().hex[:12]}-{file.filename}"
+    dest_path = dest_dir / unique_name
+    dest_path.write_bytes(content)
+
+    # Convert
+    try:
+        markdown, _title = await convert_file(dest_path)
+    except Exception as e:
+        dest_path.unlink(missing_ok=True)
+        return JSONResponse({"error": f"Conversion failed: {e}"}, status_code=500)
+
+    # Store in DB
+    file_type = get_file_type(file.filename or "")
+    async with state.db_session_factory() as session:
+        doc = await crud_documents.create_document(
+            session,
+            filename=file.filename or "unknown",
+            original_path=str(dest_path),
+            markdown_content=markdown,
+            file_type=file_type,
+            file_size=file_size,
+            user_id=user_id,
+        )
+
+    return JSONResponse(doc, status_code=201)
+
+
+@app.get("/documents")
+async def documents_list(
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    """List ingested documents."""
+    from fastapi import HTTPException
+    from .db import crud_documents
+
+    state = _state()
+
+    if not state.config.documents.enabled:
+        return JSONResponse({"error": "Documents feature is not enabled"}, status_code=400)
+    if not state.db_session_factory:
+        return JSONResponse({"error": "Database required"}, status_code=400)
+
+    user_id = None
+    if state.config.auth.enabled:
+        from .auth import decode_token
+        payload = decode_token(authorization.replace("Bearer ", ""), state.config)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = payload.get("sub")
+
+    limit = int(request.query_params.get("limit", "50"))
+    offset = int(request.query_params.get("offset", "0"))
+
+    async with state.db_session_factory() as session:
+        docs = await crud_documents.list_documents(
+            session, user_id=user_id, limit=limit, offset=offset,
+        )
+        total = await crud_documents.count_documents(session, user_id=user_id)
+
+    return JSONResponse({"documents": docs, "total": total})
+
+
+@app.get("/documents/{doc_id}")
+async def documents_get(doc_id: str, authorization: str = Header(default="")):
+    """Get a specific document including its markdown content."""
+    from fastapi import HTTPException
+    from .db import crud_documents
+
+    state = _state()
+
+    if not state.config.documents.enabled:
+        return JSONResponse({"error": "Documents feature is not enabled"}, status_code=400)
+    if not state.db_session_factory:
+        return JSONResponse({"error": "Database required"}, status_code=400)
+
+    user_id = None
+    if state.config.auth.enabled:
+        from .auth import decode_token
+        payload = decode_token(authorization.replace("Bearer ", ""), state.config)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = payload.get("sub")
+
+    async with state.db_session_factory() as session:
+        doc = await crud_documents.get_document(session, doc_id)
+
+    if not doc:
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+
+    # Ownership check
+    if user_id and doc.get("user_id") and doc["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+    return JSONResponse(doc)
+
+
+@app.delete("/documents/{doc_id}")
+async def documents_delete(doc_id: str, authorization: str = Header(default="")):
+    """Delete a document and its file from disk."""
+    from fastapi import HTTPException
+    from pathlib import Path as _Path
+    from .db import crud_documents
+
+    state = _state()
+
+    if not state.config.documents.enabled:
+        return JSONResponse({"error": "Documents feature is not enabled"}, status_code=400)
+    if not state.db_session_factory:
+        return JSONResponse({"error": "Database required"}, status_code=400)
+
+    user_id = None
+    if state.config.auth.enabled:
+        from .auth import decode_token
+        payload = decode_token(authorization.replace("Bearer ", ""), state.config)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = payload.get("sub")
+
+    async with state.db_session_factory() as session:
+        # Fetch first for ownership check + disk cleanup
+        doc = await crud_documents.get_document(session, doc_id)
+        if not doc:
+            return JSONResponse({"error": "Document not found"}, status_code=404)
+
+        if user_id and doc.get("user_id") and doc["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+        # Remove file from disk
+        try:
+            _Path(doc["original_path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        # Remove from DB
+        await crud_documents.delete_document(session, doc_id)
+
+    return JSONResponse({"status": "deleted", "id": doc_id})
 
 
 def run(config: ProxyConfig, *, tui: bool = False) -> None:

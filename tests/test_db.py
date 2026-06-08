@@ -25,7 +25,7 @@ class TestDbInit:
                     text("SELECT name FROM sqlite_master WHERE type='table'"))
                 tables = sorted(r[0] for r in result.fetchall())
             await engine.dispose()
-            assert len(tables) == 13
+            assert len(tables) == 14
             assert "users" in tables
             assert "providers" in tables
             assert "request_logs" in tables
@@ -63,9 +63,9 @@ class TestDbInit:
 class TestModels:
     """Test table definitions."""
 
-    def test_metadata_has_13_tables(self):
+    def test_metadata_has_14_tables(self):
         from codex_proxy.db.models import metadata
-        assert len(metadata.tables) == 13
+        assert len(metadata.tables) == 14
 
     def test_all_expected_tables_exist(self):
         from codex_proxy.db.models import metadata
@@ -73,6 +73,7 @@ class TestModels:
             "users", "api_keys", "providers", "provider_keys", "models",
             "routing_rules", "request_logs", "budgets", "cost_alerts",
             "plugin_registry", "plugin_instances", "sessions", "_schema_version",
+            "documents",
         }
         assert set(metadata.tables.keys()) == expected
 

@@ -17,11 +17,24 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     # v1: Initial schema — tables are created by metadata.create_all()
     # This entry ensures the version table has a row.
     (1, "initial schema", []),
+    # v2: Document conversion & ingestion (MarkItDown)
+    (2, "add documents table", [
+        """CREATE TABLE IF NOT EXISTS documents (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36),
+            filename VARCHAR(256) NOT NULL,
+            original_path VARCHAR(512) NOT NULL,
+            markdown_content TEXT NOT NULL,
+            file_type VARCHAR(32) NOT NULL,
+            file_size INTEGER NOT NULL,
+            created_at VARCHAR(32) NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_documents_user_id ON documents(user_id)",
+    ]),
 ]
 
 # Future migrations would be appended here:
-# (2, "add X column", ["ALTER TABLE ... ADD COLUMN ..."]),
-# (3, "create Y index", ["CREATE INDEX ..."])
+# (3, "add X column", ["ALTER TABLE ... ADD COLUMN ..."]),
 
 
 async def run_migrations(conn: AsyncConnection) -> None:
