@@ -38,6 +38,11 @@ Z.AI, Groq, Together AI, OpenRouter, Ollama, Anthropic, Gemini, DeepSeek, and 10
 
 **One config file. One command. Every AI model.**
 
+<div align="center">
+  <img src="assets/tui-dashboard.png" alt="codex-proxy TUI Dashboard" width="700">
+  <br><em>Live TUI dashboard — real-time metrics, circuit breaker state, key rotation</em>
+</div>
+
 ---
 
 ## ⚡ Install in 30 seconds
